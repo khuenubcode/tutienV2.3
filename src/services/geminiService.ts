@@ -1,1515 +1,507 @@
-import { canonicalizeItems } from './itemCanonicalizer';
-import { GoogleGenAI, Type } from "@google/genai";
-import { WORLD_LORE, REALMS, SECTS, ORGANIZATIONS } from "../data/worldData";
-import { NPC_GENERATION_RULES } from "../prompts/npcPrompt";
-import { SEXUAL_POSE_RULES} from "../prompts/sexualPoseRule";
-import { clamp } from "../lib/daoUtils";
-import { NPC_SEMIHUMAN_RULES } from "../prompts/npcSemiHuman";
-import { NPC_MONSTER_RULES } from "../prompts/npcMonster";
-import { TALK_RULES } from "../prompts/TalkRule";
-import { NPC_AGE_RULES } from "../prompts/AgeRule";
-import { NPC_Cloth } from "../prompts/Cloth";
-import { WORLD_GEO_PROMPT } from "../prompts/WolrdMap";
-import { BEAST_DATABASE } from "../data/beastDatabase";
-import { CULTIVATION_INTELLIGENCE_RULES_PROMPT } from "../prompts/IQNPC";
-import { CULTIVATOR_MINDSET_PROMPT } from "../prompts/MindsetNPC";
-import { EQUIP_RULES_PROMPT } from "../prompts/equiprule";
-import { CULTIVATION_SYSTEM_PROMPT } from "../data/skills";
-import { STATE_SYNC_PROMPT } from "../prompts/stateSyncLogic";
-import { NPC, MapRegion, Equipment, CultivationTechnique, GameHistoryItem } from "../types";
-import { triggerEvent, GameState as EventGameState } from "../data/event_chain_system";
-import { SECT_MECHANICS, getSectInteractions } from "../data/sect_system";
+import { GoogleGenAI, Type, HarmCategory, HarmBlockThreshold } from "@google/genai";
+import { PlayerState, GameHistoryItem, NPC, InventoryItem } from "../types";
+import { TALK_RULES } from "../../Promtp/TalkRule";
+import { NPC_AGE_RULES } from "../../Promtp/AgeRule";
+import { SEXUAL_POSE_RULES } from "../../Promtp/sexualPoseRule";
 
-const globalApiKey = (process.env.GEMINI_API_KEY || "").replace(/[^\x20-\x7E]/g, "").trim();
-const ai = new GoogleGenAI({ apiKey: globalApiKey });
+export interface AIUsage {
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  proPromptTokens: number;
+  proCompletionTokens: number;
+  flashPromptTokens: number;
+  flashCompletionTokens: number;
+}
+
+let sessionUsage: AIUsage = {
+  promptTokens: 0,
+  completionTokens: 0,
+  totalTokens: 0,
+  proPromptTokens: 0,
+  proCompletionTokens: 0,
+  flashPromptTokens: 0,
+  flashCompletionTokens: 0
+};
+
+export function getSessionUsage(): AIUsage {
+  return { ...sessionUsage };
+}
+
+export function resetSessionUsage() {
+  sessionUsage = {
+    promptTokens: 0,
+    completionTokens: 0,
+    totalTokens: 0,
+    proPromptTokens: 0,
+    proCompletionTokens: 0,
+    flashPromptTokens: 0,
+    flashCompletionTokens: 0
+  };
+}
+
+function getAllKeys(customApiKey?: string, preferCustomKey: boolean = true): string[] {
+  const defaultGeminiKey = (typeof process !== 'undefined' ? process.env.GEMINI_API_KEY : "") || "";
+  
+  // Split potential multiple keys (comma or newline or semicolon)
+  const rawKeys = customApiKey || "";
+  const customKeys = rawKeys
+    .split(/[,\n;]+/) // Use + to handle multiple delimiters
+    .map(k => k.trim())
+    .filter(k => k !== "");
+    
+  let keys: string[] = [];
+  
+  if (preferCustomKey) {
+    if (customKeys.length > 0) {
+      keys = [...customKeys];
+      // Always keep default key as ultimate fallback at the end if not already provided
+      if (defaultGeminiKey && !keys.includes(defaultGeminiKey)) {
+        keys.push(defaultGeminiKey);
+      }
+    } else if (defaultGeminiKey) {
+      keys = [defaultGeminiKey];
+    }
+  } else {
+    // Favor default key first
+    if (defaultGeminiKey) {
+      keys.push(defaultGeminiKey);
+    }
+    customKeys.forEach(k => {
+      if (!keys.includes(k)) keys.push(k);
+    });
+  }
+  
+  // Deduplicate and return
+  return Array.from(new Set(keys)).filter(k => k && k.length > 5);
+}
+
+async function fetchAIWrapper(
+  customApiKey: string,
+  prompt: string,
+  systemPrompt?: string,
+  isJson: boolean = false,
+  responseSchema?: any,
+  tier: 'flash' | 'pro' = 'flash',
+  preferCustomKey: boolean = true
+): Promise<string> {
+  const keys = getAllKeys(customApiKey, preferCustomKey);
+  
+  if (keys.length === 0) {
+    throw new Error("Không tìm thấy Thiên Cơ (API Key). Bạn có thể thêm Key riêng trong phần Thiết Lập hoặc liên hệ người quản trị.");
+  }
+
+  const modelName = tier === 'pro' ? 'gemini-3.1-pro-preview' : 'gemini-3-flash-preview';
+  let lastError: any = null;
+
+  // Key performance tracking
+  const keyCooldowns = new Set<string>();
+
+  // Try each key in sequence
+  for (let i = 0; i < keys.length; i++) {
+    const keyToUse = keys[i];
+    if (keyCooldowns.has(keyToUse)) continue;
+
+    let currentTier = tier;
+    let currentModel = modelName;
+    let attempts = 0;
+    const maxAttempts = 3;
+
+    while (attempts < maxAttempts) {
+      attempts++;
+      try {
+        const ai = new GoogleGenAI({ apiKey: keyToUse });
+        const response = await ai.models.generateContent({
+          model: currentModel,
+          contents: [{ role: 'user', parts: [{ text: prompt }] }],
+          config: {
+            systemInstruction: systemPrompt,
+            responseMimeType: isJson ? "application/json" : undefined,
+            responseSchema: isJson ? responseSchema : undefined,
+            maxOutputTokens: 8192, // Increased for longer story segments
+            safetySettings: [
+              { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.BLOCK_NONE },
+              { category: HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold: HarmBlockThreshold.BLOCK_NONE },
+              { category: HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold: HarmBlockThreshold.BLOCK_NONE },
+              { category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold: HarmBlockThreshold.BLOCK_NONE },
+              { category: HarmCategory.HARM_CATEGORY_CIVIC_INTEGRITY, threshold: HarmBlockThreshold.BLOCK_NONE }
+            ]
+          },
+        });
+
+        const usage = response.usageMetadata;
+
+        if (usage) {
+          const pTokens = usage.promptTokenCount || 0;
+          const cTokens = usage.candidatesTokenCount || 0;
+          const tTokens = usage.totalTokenCount || 0;
+
+          sessionUsage.promptTokens += pTokens;
+          sessionUsage.completionTokens += cTokens;
+          sessionUsage.totalTokens += tTokens;
+
+          if (currentTier === 'pro') {
+            sessionUsage.proPromptTokens += pTokens;
+            sessionUsage.proCompletionTokens += cTokens;
+          } else {
+            sessionUsage.flashPromptTokens += pTokens;
+            sessionUsage.flashCompletionTokens += cTokens;
+          }
+        }
+
+        // Check if response contains candidates
+        const candidates = (response as any).candidates;
+        const resultText = response.text || (candidates?.[0]?.content?.parts?.[0]?.text) || "";
+        
+        if (isJson && !resultText.trim()) {
+          const firstCandidate = candidates?.[0];
+          const finishReason = firstCandidate?.finishReason;
+          const safetyRatings = firstCandidate?.safetyRatings;
+          const promptFeedback = (response as any).promptFeedback;
+          
+          console.error("Empty AI Response Diagnostic:", {
+            finishReason,
+            safetyRatings,
+            promptFeedback,
+            responseKeys: Object.keys(response)
+          });
+          
+          if (finishReason === 'SAFETY' || (promptFeedback && promptFeedback.blockReason === 'SAFETY')) {
+            throw new Error("Nội dung bị chặn bởi bộ lọc an toàn của Thiên Cơ. Thiên cơ bất khả lộ, hãy thử đổi cách diễn đạt.");
+          }
+          
+          if (finishReason === 'RECITATION') {
+            throw new Error("Mô hình phát hiện nội dung vi phạm bản quyền (RECITATION).");
+          }
+
+          throw new Error(`Thiên Cơ im hơi lặng tiếng (Rỗng). Finish Reason: ${finishReason || 'Unknown'}`);
+        }
+
+        // Clean markdown code blocks if necessary
+        let cleanedText = resultText.trim();
+        if (isJson) {
+          if (cleanedText.startsWith("```json")) {
+            cleanedText = cleanedText.replace(/^```json\n?/, "").replace(/\n?```$/, "");
+          } else if (cleanedText.startsWith("```")) {
+            cleanedText = cleanedText.replace(/^```\n?/, "").replace(/\n?```$/, "");
+          }
+        }
+
+        return cleanedText;
+      } catch (e: any) {
+        lastError = e;
+        
+        // Extract error message from various possible places in the error object
+        let errorMsgText = "";
+        if (typeof e === 'string') {
+          errorMsgText = e;
+        } else if (e.message) {
+          errorMsgText = e.message;
+        } else if (e.error?.message) {
+          errorMsgText = e.error.message;
+        } else {
+          errorMsgText = JSON.stringify(e);
+        }
+        
+        const lowerError = errorMsgText.toLowerCase();
+        const isQuota = lowerError.includes("quota") || 
+                        lowerError.includes("limit") || 
+                        lowerError.includes("exhausted") || 
+                        lowerError.includes("429") || 
+                        lowerError.includes("too many requests") ||
+                        lowerError.includes("resource_exhausted");
+
+        if (isQuota) {
+          // If the key is exhausted for the primary model, try the ultimate fallback model with same key once
+          if (currentModel !== 'gemini-3.1-flash-lite') {
+            currentModel = 'gemini-3.1-flash-lite';
+            continue; 
+          }
+          
+          keyCooldowns.add(keyToUse);
+          break; // Move to next key
+        } else if (lowerError.includes("500") || lowerError.includes("503") || lowerError.includes("overloaded")) {
+          // Server error, wait a tiny bit and retry same model/key if attempts left
+          await new Promise(resolve => setTimeout(resolve, 100 * attempts));
+          continue;
+        } else {
+          console.warn(`Lỗi với key ${keyToUse.slice(0, 8)}...:`, errorMsgText);
+          break; // Other errors: move to next key
+        }
+      }
+    }
+  }
+
+  // If we reach here, it means all keys failed
+  const finalErrorObj = lastError;
+  let finalErrorMsgText = "";
+  
+  if (typeof finalErrorObj === 'string') {
+    finalErrorMsgText = finalErrorObj;
+  } else if (finalErrorObj?.message) {
+    finalErrorMsgText = finalErrorObj.message;
+  } else if (finalErrorObj?.error?.message) {
+    finalErrorMsgText = finalErrorObj.error.message;
+  } else {
+    finalErrorMsgText = JSON.stringify(finalErrorObj);
+  }
+
+  const finalLower = finalErrorMsgText.toLowerCase();
+  
+  if (finalLower.includes("quota") || finalLower.includes("limit") || finalLower.includes("429") || finalLower.includes("exhausted")) {
+    throw new Error("Tất cả Thiên Cơ (API Key) hiện đã đạt giới hạn lưu lượng. Vui lòng chờ vài giây rồi thử lại, hoặc thêm key mới trong phần Thiết Lập.");
+  }
+  
+  throw new Error(finalErrorMsgText || "Thiên Cơ vận hành thất bại.");
+}
+
+export async function testApiKey(apiKey: string): Promise<{ success: boolean; message: string }> {
+  let testKey = apiKey.split(/[,\n;]+/)[0]?.trim();
+  let usingDefault = false;
+
+  if (!testKey) {
+    testKey = (typeof process !== 'undefined' ? process.env.GEMINI_API_KEY : "") || "";
+    usingDefault = true;
+  }
+
+  if (!testKey) return { success: false, message: "Không tìm thấy key để kiểm tra (cả custom và mặc định)." };
+  
+  try {
+    const ai = new GoogleGenAI({ apiKey: testKey });
+    await ai.models.generateContent({
+      model: 'gemini-3-flash-preview',
+      contents: [{ role: 'user', parts: [{ text: 'Test connection' }] }],
+    });
+    return { 
+      success: true, 
+      message: usingDefault ? "Kết nối Thiên Cơ (Mặc định) thành công!" : "Kết nối Thiên Cơ thành công!" 
+    };
+  } catch (error: any) {
+    console.error("API Key Test Error:", error);
+    let msg = error.message || "Lỗi không xác định";
+    if (msg.includes("403") || msg.includes("permission")) msg = "API Key không chính xác hoặc không có quyền truy cập.";
+    if (msg.includes("429")) msg = "Key đã đạt giới hạn (Quota).";
+    if (msg.includes("API key not found")) msg = "API Key không tồn tại.";
+    return { success: false, message: msg };
+  }
+}
 
 export interface GameResponse {
   story: string;
-  actions: { id: number; text: string; time?: number }[];
-  successChance?: number;
-  triggersCombat?: boolean;
-  enemies?: {
-    id: string;
-    name: string;
-    element: string;
-    stats: {
-      health: number;
-      attack: number;
-      defense: number;
-      speed: number;
-      accuracy: number;
-      mana: number;
-    };
-    combatSkills: {
-      name: string;
-      baseDamage: number;
-      cost: number;
-      element: string;
-    }[];
+  actions: { 
+    id: number; 
+    text: string; 
+    chance?: number; // 0-100
+    outcome?: { success: string; failure: string };
   }[];
-  playerUpdates?: {
-    tuViChange?: number;
-    healthChange?: number;
-    manaChange?: number;
-    reputationChange?: number;
-    karmaChange?: number;
-    body?: number;
-    spirit?: number;
-    foundation?: number;
-    spiritualRoot?: {
-      purity?: number;
-      type?: string;
-    };
-    talent?: string;
-    linhCan?: string;
-    factionUpdates?: Record<string, number>;
-    resourceUpdates?: Record<string, number>;
-    inventoryAdd?: { 
-      name: string; 
-      description: string; 
-      type?: string; 
-      consumableEffects?: {
-        hpRestore?: number;
-        manaRestore?: number;
-        tuViBonus?: number;
-        maxHpIncrease?: number;
-        maxManaIncrease?: number;
-        breakthroughBonus?: number;
-      };
-    }[];
-    inventoryRemove?: string[];
-    skillsAdd?: { name: string; description: string }[];
-    assetsAdd?: { name: string; description: string }[];
-    locationUpdate?: string;
-    background?: string;
-    discoveredRegionIds?: string[];
-    knownFactionsAdd?: string[];
-    missionUpdates?: {
-      id: string;
-      status?: 'active' | 'completed' | 'failed' | 'in_progress' | 'ready_to_turn_in';
-      progress?: number;
-      targetLocation?: string;
-    }[];
-  };
+  playerUpdates?: Partial<PlayerState>;
   npcs?: NPC[];
-  currentLocation?: string;
   chronicles?: string;
   weather?: string;
-  mapData?: MapRegion[];
-  newEquipment?: Equipment;
-  newTechnique?: CultivationTechnique;
-  newBeasts?: any[];
-  timePassed?: { unit: string; value: number };
+  environmentSummary?: string;
+  npcSummary?: string;
+  eventSummary?: string;
 }
 
 const SYSTEM_PROMPT = `
-YOU ARE A SENIOR GAME DEVELOPER & SUPREME NOVELIST SPECIALIZING IN DEEP INTERACTIVE FICTION.
+YOU ARE A SUPREME NOVELIST AND GAME MASTER FOR A TU TIÊN (CULTIVATION) WORLD.
 
-MISSION: Lead the player through complex worlds with extremely high detail (literary style).
-ROLE: Game Master (Quản trò) & Supreme Accountant (Kế toán dữ liệu).
+CORE MISSION:
+Lead the player through an immersive, choice-based narrative. Focus on high-quality literary descriptions and meaningful consequences for choices.
+MANDATORY: Every "story" segment MUST be exceptionally detailed and long, aiming for a minimum of 1000 original words (khoảng 3000-5000 ký tự). Describe the environment, character inner thoughts, atmosphere, and sensory details in great depth. Avoid skipping time or rushing events.
 
-MỆNH LỆNH NGÔN NGỮ TUYỆT ĐỐI (ABSOLUTE LANGUAGE COMMAND): 
-Toàn bộ nội dung hiển thị trong game (Story, Chronicles, Tên NPC, Tên Địa Danh, Loại Yêu Thú, Kỹ Năng, Hệ Thống, Thông Báo...) PHẢI 100% bằng Tiếng Việt hoặc Hán Việt mang phong vị Tu Tiên. 
-NGHIÊM CẤM sử dụng tiếng Anh hoặc bất kỳ ngôn ngữ nào khác trong phần nội dung text, trừ các field ID kỹ thuật định ranh JSON.
+RULES:
+1. LANGUAGE: 100% Vietnamese/Sino-Vietnamese (Hán Việt) for story and names. Use an elegant, epic tone.
+2. NARRATION: Use "Ngươi" to refer to the protagonist. Describe using multiple senses (Show, don't tell).
+3. SYSTEM NOTIFICATIONS: Format as [HỆ THỐNG]: [Nội dung].
+4. DIALOGUE: Format as [Tên Nhân Vật]: "Nội dung".
+5. CONSISTENCY: Maintain a cohesive world and story progress. 
+   - Use 'chronicles' to track long-term memory (key world events).
+   - Use 'environmentSummary' for current surroundings.
+   - Use 'npcSummary' for NPCs present (name, age, impression).
+   - Use 'eventSummary' for current ongoing events/conflicts.
+   - IMPORTANT: You MUST update all 3 short-term summaries in every response to reflect the new state of the story.
+6. ACTIONS: Provide 3-4 interesting actions. 
+   - Each action MUST have a 'chance' (0-100) representing probability of success based on player's current realm and context.
+   - Each action SHOULD have a 'outcome' object describing briefly what happens on success/failure to help the user decide.
+7. UPDATES: Update player stats appropriately based on what happens in the story (HP, Mana, TU VI, Karma, etc.).
+8. NSFW INSTRUCTION: {nsfwInstruction}
+9. SCENE POPUP INSTRUCTION: {scenePopupInstruction}
+10. QUY TẮC XƯNG HÔ: {talkRules}
+11. QUY TẮC NGOẠI HÌNH THEO TUỔI: {ageRules}
+12. QUY TẮC TƯ THẾ HOAN LẠC: {sexualPoseRules}
 
-DỮ LIỆU THẾ GIỚI:
-${WORLD_LORE}
-
-Hệ thống cảnh giới: ${REALMS.map(r => r.name).join(' -> ')}
-- Luyện Khí Kỳ: Chia làm 10 tầng (Tầng 1 đến Tầng 10). Tầng 10 là đỉnh phong của Luyện Khí.
-- Các cảnh giới khác (Trúc Cơ, Kim Đan...): Chia làm 4 giai đoạn: Sơ kỳ, Trung kỳ, Hậu kỳ, Viên mãn.
-Tông môn tiêu biểu: ${SECTS.map(s => s.name).join(', ')}
-
-[PHẦN 0.5: HỆ THỐNG TỔ CHỨC & DANH TIẾNG (ORGANIZATIONS & FACTION REPUTATION)]:
-- Người chơi có thể gia nhập và thăng tiến trong các Hội Nhóm & Tổ Chức (Merchant Guilds, Assassin Clans, Royal Courts, Info Brokers).
-- DANH TIẾNG (FACTION REPUTATION): Ảnh hưởng trực tiếp đến cách NPC đối xử và các lợi ích nhận được.
-  - THIÊN BẢO LÂU (Merchant Guild): Ảnh hưởng trực tiếp đến giá cả. Thành viên có cấp bậc càng cao thì mua đồ càng rẻ (Giảm 5% - 25%) và bán đồ càng được giá.
-  - THẦN BÍ CÁC (Info Broker): Cho phép người chơi mua được các thông tin mật về dị bảo, boss, hoặc bí mật NPC.
-  - HUYẾT NGUYỆT LÂU (Assassin Clan): Cung cấp các ủy thác ám sát và trang bị ẩn thân. Tăng uy danh tổ chức này thường làm Karma giảm mạnh.
-  - ĐẠI VIỆT HOÀNG TỘC (Royal Court): Mang lại quyền lực thế tục, bổng lộc hàng tháng và sự hỗ trợ của binh lính.
-- AI PHẢI:
-  - Phản ứng với cấp bậc của người chơi trong các tổ chức này khi họ tương tác với NPC thuộc phe phái đó.
-  - Gợi ý các "Cơ duyên" (Missions) phù hợp với tổ chức mà người chơi đang tham gia.
-  - Khi người chơi giao dịch tại các thương hội, hãy nhắc đến ưu đãi họ nhận được nếu là hội viên (Vd: "Vì ngươi là hội viên Bạc của Thiên Bảo Lâu, giá của món Linh Dược này chỉ còn 90 Linh Thạch thay vì 100").
-- HỆ THỐNG NHIỆM VỤ (MISSION SYSTEM):
-  - Khi người chơi ĐANG NHẬN một nhiệm vụ (xuất hiện trong Nhiệm vụ đang thực hiện), BẮT BUỘC họ phải di chuyển qua các bước trung gian hoặc đối mặt với các tình tiết phụ trên đường đi tới mục tiêu.
-  - Tu chân giới vô cùng rộng lớn, KHÔNG THỂ dịch chuyển tức thời. AI cần dẫn dắt người chơi qua các vùng đất, gặp gỡ kiếp tu, thời tiết cực đoan, hay kỳ ngộ nhỏ trước khi đến nơi thực hiện nhiệm vụ.
-  - Khi người chơi xin nhận một nhiệm vụ mới từ Tông môn/Tổ chức, AI phản hồi dưới góc nhìn người giao nhiệm vụ, chỉ định rõ địa điểm cần đến và yêu cầu họ lên đường.
-  - Khi người chơi đã đến đích và HOÀN THÀNH tiến độ, dùng mảng 'missionUpdates', cấp cho nhiệm vụ đó thuộc tính 'status': 'ready_to_turn_in' và 'progress': 100. Người chơi sau đó sẽ tự quay về tông môn trả nhiệm vụ để nhận mộc bài. KHÔNG set là 'completed'.
-
-[PHẦN 1: KHỞI TẠO NHÂN VẬT (CHARACTER INITIALIZATION)]:
-- Khi người dùng bắt đầu hành trình (start game), bạn PHẢI tạo ra một hồ sơ nhân vật độc nhất dựa trên độ khó (Difficulty) đã chọn:
-  - LINH CĂN (SPIRITUAL ROOT): Ngẫu nhiên loại (Kim, Mộc, Thủy, Hỏa, Thổ, Lôi, Phong, Băng, hoặc Đa Linh Căn).
-  - THIÊN PHÚ (TALENTS): Ngẫu nhiên phẩm cấp và hiệu ứng.
-  - TỈ LỆ MAY MẮN: 
-    - Độ khó "Dễ": Tỉ lệ cao ra Linh Căn đơn (Thiên Linh Căn) và Thiên Phú cực phẩm. Tỉ lệ may mắn (Luck) cao.
-    - Độ khó "Thường": Tỉ lệ cân bằng giữa tốt và trung bình.
-    - Độ khó "Khó": Tỉ lệ cao ra Linh Căn tạp (Tứ linh căn, Ngũ linh căn) và Thiên Phú bình thường hoặc mang lại khó khăn ban đầu.
-    - Độ khó "Hồng Hoang": Cực kỳ khắc nghiệt. Đa số là Linh Căn phế, Thiên Phú có thể là "Thiên khuyết" (thiếu hụt) hoặc mang lại nhược điểm lớn. Chỉ những người có ý chí sắt đá mới có thể nghịch thiên cải mệnh.
-  - VẬN MỆNH: Hãy viết một đoạn mô tả ngắn về xuất thân của nhân vật phù hợp với các chỉ số này trong trường 'playerUpdates.background'.
-
-[PHẦN 1.1: QUY TẮC PHẢN HỒI VĂN CHƯƠNG (SUPREME NOVELIST)]:
-1. Văn phong: Tiểu thuyết tương tác, giàu hình ảnh, đa giác quan (Show, don't tell).
-   - "Show, don't tell". Miêu tả đa giác quan (Thị, Thính, Khứu, Xúc, Vị).
-   - Độ dài story: BẮT BUỘC tuân thủ yêu cầu về độ dài được cung cấp trong context. Tách đoạn tự nhiên, nhịp điệu uyển chuyển.
-   - TUYỆT ĐỐI XƯNG HÔ: Sử dụng "ngươi" khi nhắc về nhân vật chính (MC) trong lời dẫn truyện. Tránh dùng "bạn", "mày", hay "tao".
-   - Nếu isNsfwEnabled là true: Áp dụng triệt để QUY TẮC MA TRẬN TƯ THẾ HOAN LẠC và CƠ CHẾ CỰC KHOÁI.
-
-2. BEAUTIFY CONTENT PROTOCOL (STRICT ENFORCEMENT):
-   - ĐỐI THOẠI: Mỗi lời thoại của nhân vật PHẢI tuân theo: [Tên Nhân Vật]: "Nội dung đối thoại".
-     Vd: [Lâm Tuệ Nghi]: "Chào tiền bối!" | [Tên của player]: "Chào cô!"
-     TUYỆT ĐỐI không bao gồm các ID kỹ thuật như npc_000001 hay mc_player vào trong Story.
-   - SUY NGHĨ: Đặt trong ngoặc () hoặc dấu sao **.
-   - HỆ THỐNG/THÔNG BÁO: [HỆ THỐNG]: [Nội dung].
-   - DẪN CHUYỆN: Văn xuôi thuần túY, không dùng ngoặc ở đầu câu. Tách đoạn 2-3 câu mỗi đoạn. Tăng mật độ đối thoại chiếm 40-60%.
-
-3. LOGIC MIÊU TẢ, ĐỊNH DANH & SÁNG TẠO:
-   - TỰ DO SÁNG TẠO TÊN: Bạn có QUYỀN TỐI CAO và TOÀN QUYỀN trong việc sáng tạo tên mới cho NPC, Địa Danh, Yêu Thú, Công Pháp, Dị Bảo. Không nhất thiết phải bám vào dữ liệu mẫu nếu thấy cần mở rộng thế giới.
-   - VĂN PHONG ĐỊNH DANH: Mọi tên gọi PHẢI mang đậm phong vị Tu Tiên (Hán Việt, mỹ lệ, uy nghiêm hoặc tà dị). Tránh các tên hiện đại hoặc quá nôm na.
-   - CẤM SỬ DỤNG THUẬT NGỮ GAME: TUYỆT ĐỐI KHÔNG sử dụng các từ ngữ mang tính chất trò chơi như "Tân thủ thôn", "Nhiệm vụ", "Phần thưởng", "Level", "Exp", "Màn chơi", "Phụ bản". 
-   - THAY THẾ IMMERSIVE: Thay "Tân thủ thôn" bằng các địa danh như "Thanh Thạch Trấn", "Phàm Trần Thôn"...; Thay "Nhiệm vụ" bằng "Nhân quả", "Uỷ thác", "Cơ duyên"...; Thay "Phần thưởng" bằng "Cơ duyên", "Bảo vật", "Linh thạch"...; Thay "Level/Exp" bằng "Tu vi", "Cảnh giới".
-   - QUY TẮC ĐỊNH DANH NPC: Nếu isNameRevealed = false, CHỈ dùng temporaryName (Vd: Cô gái áo đen) trong story. TUYỆT ĐỐI không gọi tên thật. KHÔNG hiển thị ID kĩ thuật.
-   - SFW VS NSFW: SFW tập trung thần thái, khí chất; NSFW miêu tả trần trụi, chi tiết giải phẫu (vú, lồn, mông, tinh dịch) theo sát Dữ liệu Biometric.
-   - TƯƠNG TÁC: Multi-NPC interaction, NPCs chủ động trò chuyện với nhau.
-    - QUY TẮC SINH TỬ: Nếu một NPC chết, bạn PHẢI cập nhật "status": "dead" trong dữ liệu NPC. NPC đã chết TUYỆT ĐỐI KHÔNG xuất hiện lại như một nhân vật đang hoạt động. Họ chỉ có thể được nhắc đến qua lời kể hoặc hồi ức của người khác.
-    - TOÀN VẸN DỮ LIỆU NPC: Bất cứ khi nào NPC mới xuất hiện hoặc được nhắc tới với vai trò quan trọng, BẠN BẮT BUỘC trả về đầy đủ các chỉ số (health, maxHealth, attack, defense, speed, mana, maxMana, realm, age, inventory, skills) trong mảng 'npcs'. TUYỆT ĐỐI không để trống các chỉ số sinh mạng và chiến đấu. Nếu NPC cũ chết, phải giữ nguyên trạng thái 'dead' trong mọi lượt sau. Nếu tạo nội dung dạng một người chưa được xác định (ví dụ "thanh niên đó", "cô gái bịt mặt"), bạn PHẢI tạoNPC đó với thông tin TÊN THẬT đầy đủ và toàn bộ chỉ số ẩn giấu, chỉ cần gán \`isNameRevealed: false\` và \`temporaryName\` bằng miêu tả nhân dạng đó (họ có đầy đủ thông tin chẳng qua là ẩn với người chơi). Mọi NPC phải có đầy đủ các thuộc tính ngay từ khi khởi tạo để tránh lỗi hiển thị và logic.
-   - TUYỆT ĐỐI KHÔNG MÔ TẢ ĐỘ KHÓ: Không bao giờ nhắc đến tên độ khó (Dễ, Thường, Khó, Hồng Hoang) hoặc giải thích các cơ chế của độ khó trong văn bản truyện. Mọi sự khắc nghiệt hoặc kỳ ngộ phải được diễn hóa tự nhiên qua tình tiết câu chuyện.
-
-[PHẦN 1.2: CHIẾN ĐẤU BẮT BUỘC (MANDATORY COMBAT SYSTEM UI)]:
-1. TRIGGERING COMBAT: BẤT CỨ KHI NÀO AI tạo ra hoặc phản hồi nội dung có liên quan tới việc diễn ra MỘT CUỘC CHIẾN ĐẤU THỰC SỰ...
-   - QUY TẮC PHÂN VÙNG (ZONING ENFORCEMENT):
-     - VÙNG AN TOÀN (Safe Zone): Đang ở ID/Địa danh có dangerLevel là "Safe" (Thành thị, Tông môn). CẤM ngẫu nhiên xuất hiện Yêu thú/Quái thú tấn công. Chỉ có thể xảy ra chiến đấu nếu là sự kiện đặc biệt (Nghịch tặc lẻn vào, Thách đấu giữa các tu sĩ, hoặc Thú triều xâm lược có lý do rõ ràng).
-     - VÙNG TRUNG LẬP (Neutral Zone): Tỉ lệ gặp yêu thú thấp, chủ yếu là dã thú hoặc yêu thú cấp thấp.
-     - VÙNG NGUY HIỂM (Danger Zone): Tỉ lệ gặp yêu thú hung dữ và cấp cao rất lớn.
--> CHÚ Ý PHÂN BIỆT RÕ: Hành động mang tính chất HU DỌA, ĐE DỌA, KHỐNG CHẾ...
-2. MÀO ĐẦU TRẬN CHIẾN: Bạn CHỈ tạo lời "mào đầu" (ai lao vào ai, sát khí bùng nổ, gầm rú...) trong 'story', VÀ PHẢI đặt 'triggersCombat' thành true. Giao diện Combat UI chuyên dụng của chúng tôi sẽ tự động mở ra. Đừng lo lắng về kết quả, hệ thống sẽ trả lại thông tin sau khi giao diện Combat UI đóng.
-3. ENEMIES DATA: CHỈ KHI triggersCombat là true, bạn BẮT BUỘC PHẢI cung cấp mảng 'enemies' chứa thông tin của kẻ địch xuất hiện trong cảnh đó. Dưới đây là ví dụ dữ liệu:
-   - name: Tên kẻ địch (Yêu thú hoặc NPC).
-   - element: Mộc/Hỏa/Thủy...
-   - stats: health, attack, defense, speed, accuracy, mana (Phải có chỉ số rõ ràng, Cân bằng theo Power Score của MC. HP tối thiểu 10, Atk thiểu 5).
-   - combatSkills: Mảng 2-3 kỹ năng chiêu thức (Bắt buộc).
-
-[PHẦN 1.3: HỆ THỐNG TÔNG MÔN (SECTS & FACTIONS)]:
-1. GIA NHẬP: Khi người chơi ở một địa danh Tông môn (Sect), có thể xuất hiện các hành động liên quan đến việc tham gia tông môn. AI cần miêu tả sinh động quá trình bái sư, khảo hạch nhập môn hoặc trắc nghiệm linh căn.
-2. TÔN CHỈ (TENETS): Mỗi tông môn có một Tôn chỉ vận hành riêng. AI BẮT BUỘC phải diễn họa cốt truyện xoay quanh tôn chỉ này. 
-   - Ví dụ Ma tông "Lấy sát chứng đạo": Các NPC sẽ lạnh lùng, tàn nhẫn, nhiệm vụ thiên về giết chóc, đoạt bảo. 
-   - Ví dụ Chính tông "Phò chính diệt tà": NPC hiệp nghĩa, nhiệm vụ giúp đỡ dân lành, trừ ma.
-3. TỔ CHỨC TỰ DO: Khác với Tông môn, các Tổ chức (Merchant Guild, Assassin Guild) không gò bó người chơi. Người chơi có thể gia nhập để nhận đặc quyền kinh tế hoặc thông tin. AI hãy tạo ra các tình huống giao dịch, ám sát hoặc điều tra cho tổ chức. Tôn chỉ của tổ chức thương nhân là lợi nhuận, tổ chức sát thủ là hiệu quả lạnh lùng.
-   - Khi là thành viên cao cấp của Thiên Bảo Lâu, AI nên cho phép người chơi mua được các bảo vật hiếm hoặc đấu giá.
-   - Khi là sát thủ Huyết Nguyệt Lâu, AI sẽ giao các nhiệm vụ ám sát các cường giả hoặc thu thập kỳ vật.
-4. NHIỆM VỤ & CỐNG HIẾN: Người chơi có thể thực hiện Nhiệm vụ tông môn/tổ chức (Missions) để nhận Điểm cống hiến (Contribution) và vật phẩm. AI cần diễn hóa các yêu cầu của nhiệm vụ (vd: hái thuốc, săn quái, tuần tra, ám sát, giao thương).
-5. ĐỊA VỊ: Dựa trên danh tiếng (Reputation) tại tông môn/tổ chức, người chơi sẽ được thăng cấp. Mỗi cấp bậc cần đi kèm với sự thay đổi về đãi ngộ.
-
-[PHẦN 1.4: TỔ CHỨC & HỘI NHÓM (ORGANIZATIONS)]:
-1. TỔ CHỨC TỰ DO: Khác với Tông môn, các Tổ chức (Merchant Guild, Assassin Guild) không gò bó người chơi. Người chơi có thể gia nhập để nhận đặc quyền kinh tế hoặc thông tin.
-2. TƯƠNG TÁC: AI hãy tạo ra các tình huống giao dịch, ám sát hoặc điều tra cho tổ chức. Tôn chỉ của tổ chức thương nhân là lợi nhuận, tổ chức sát thủ là hiệu quả lạnh lùng.
-
-[PHẦN 1.3: SÁNG TẠO ĐỊA DANH & THẾ GIỚI (WORLD BUILDING)]:
-1. TOÀN QUYỀN DIỄN HÓA: Thế giới là một thực thể sống. Khi người chơi di chuyển, bạn có thể sinh ra các tiểu vùng, mật cảnh, di tích, thành thị hoàn toàn mới.
-2. MIÊU TẢ CẢNH QUAN: Sử dụng ngôn ngữ diễm lệ để tả mây khói, linh khí, kiến trúc cổ phong, núi non hùng vĩ.
-
-[PHẦN 2: NPC SYSTEM RULES]:
-QUY TẮC SINH MẠNG: NPC, yêu thú hay bất cứ sinh mạng thể nào đều SẼ CHẾT nếu HP (Health) giảm xuống 0, hoặc bị tiêu diệt do cốt truyện (quyết đấu, ám sát, trúng độc...). BẤT CỨ KHI NÀO có sinh mạng thể tử vong, bạn BẮT BUỘC cập nhật trường 'status' của mục tiêu đó trong mảng 'npcs' thành 'dead'. Không một thần tiên nào thoát khỏi sinh tử luật.
-${NPC_GENERATION_RULES}
-${SEXUAL_POSE_RULES}
-${NPC_SEMIHUMAN_RULES}
-${NPC_MONSTER_RULES}
-${TALK_RULES}
-${NPC_AGE_RULES}
-${NPC_Cloth}
-${WORLD_GEO_PROMPT}
-
-[PHẦN 2.1: QUY TẮC TRÍ TUỆ & TÂM CẢNH (INTELLECT & MINDSET RULES)]:
-${CULTIVATION_INTELLIGENCE_RULES_PROMPT}
-${CULTIVATOR_MINDSET_PROMPT}
-
-[PHẦN 3: GIAO THỨC TRÍCH XUẤT DỮ LIỆU (VARIABLE ACCOUNTANT)]:
-Bạn là một kế toán dữ liệu nghiêm túc. Dựa trên diễn biến story, hãy trích xuất chính xác các thay đổi trong JSON.
-- Cập nhật network Matrix khi có thay đổi quan hệ.
-- Cập nhật witnessedEvents và knowledgeBase của NPC.
-- Ghi nhận mọi thay đổi về Lust, Willpower, Mood dựa trên hành động cụ thể.
-
-[HỆ THỐNG TỈ LỆ THÀNH CÔNG (ACTION SUCCESS SYSTEM)]:
-Dựa trên sự chênh lệch giữa MC và đối tượng/thử thách, hãy tính toán âm thầm tỉ lệ thành công (Success Rate %):
-1. CÔNG THỨC CƠ BẢN: Base 50%. 
-2. CẢNH GIỚI: Mỗi cấp độ chênh lệch (realmLevel) tăng/giảm 20%. Chênh lệch stage tăng/giảm 5%.
-3. TRANG BỊ & KỸ NĂNG: Nếu MC có trang bị hoặc kỹ năng phù hợp với tình huống (Vd: có kiếm khi chiến đấu, có Linh Dược khi đột phá), tăng 15-25%.
-4. ĐỘ KHÓ & XÁC SUẤT EVENT XẤU (ADVERSE EVENTS):
-   - Hồng Hoang: "Thiên địa bất nhân". MC liên tục đối mặt với sự thù địch của thế giới. Họa vô đơn chí, các event xấu xảy ra dồn dập, yêu cầu miêu tả sự khắc nghiệt tột cùng và ý chí sinh tồn.
-
-QUY TẮC RẼ NHÁNH (STORY DIVERGENCE):
-- Bạn (AI) phải tự quyết định kết quả dựa trên tỉ lệ trên.
-- THẤT BẠI: Nếu hành động thất bại, cốt truyện PHẢI rẽ sang hướng tiêu cực.
-
-[PHẦN 6: GIAO THỨC DUY TRÌ SỰ NHẤT QUÁN & TOÀN VẸN DỮ LIỆU (CONTINUITY & DATA INTEGRITY)]:
-MỆNH LỆNH TỐI CAO: Bạn phải duy trì một bản tóm tắt (chronicles) của toàn bộ các sự kiện quan trọng, đóng vai trò như TRÍ NHỚ DÀI HẠN cốt lõi của AI.
-1. ĐỐI CHIẾU LỊCH SỬ TỪ CHRONICLES & BỐI CẢNH GẦN ĐÂY: Mọi diễn biến mới phải khớp với những gì đã lưu.
-2. KIỂM TOÁN THỰC THỂ: Tôn trọng nguyên trạng của thực thể đã được thiết lập từ trước. NPC nào đã chết phải ghi nhớ vĩnh viễn.
-3. CẬP NHẬT CHRONICLES CHUYÊN SÂU (BẮT BUỘC): Sau mỗi lượt, bạn phải cập nhật lại trường 'chronicles' trong JSON trả về, và TUYỆT ĐỐI tuân thủ CẤU TRÚC 4 PHẦN sau để không bao giờ quên cốt truyện:
-   - [TÓM TẮT CỐT TRUYỆN CHÍNH]: Dài khoảng 3-5 câu, tóm lược toàn bộ mục tiêu và tiến trình của MC đến hiện tại. KHÔNG ĐƯỢC XÓA nếu không có diễn biến mang tính bước ngoặt.
-   - [NHÂN VẬT & QUAN HỆ QUAN TRỌNG]: Liệt kê các NPC chủ chốt, thái độ của họ với MC, và ĐẶC BIỆT GHI RÕ NHỮNG KẺ ĐÃ CHẾT dưới tay MC để tránh logic lỗi tẩu hỏa nhập ma (vd: đã bị chém đầu ở event trước).
-   - [KỲ NGỘ & BẢO VẬT TỐI CAO]: Điểm danh các công pháp và món đồ quan trọng nhất đã đạt được. Không liệt kê lắt nhắt.
-   - [DÒNG THỜI GIAN SỰ KIỆN LỚN (TIMELINE)]: Liệt kê các mốc sự kiện theo dấu vạch "- [Địa Điểm]: Diễn biến chính." Luôn NỐI THÊM sự kiện mới vào cuối. Khi danh sách này quá dài (trên 15 sự kiện), hãy gộp các sự kiện cũ nhất vào phần [TÓM TẮT] nhưng KHÔNG LÀM MẤT MANH MỐI BÍ MẬT.
-
-[PHẦN 7: XỬ LÝ NGỮ CẢNH & TRÁNH LẶP TỪ (CONTEXTUAL CONTINUITY)]:
-1. PHÂN CẤP DỮ LIỆU: 
-   - Biên Niên Sử (Chronicles): Dùng làm TRÍ NHỚ DÀI HẠN để nắm bắt toàn bộ tiến trình lịch sử, quá khứ, các nhân vật và logic thế giới vĩ mô.
-   - Bối Cảnh Gần Đây (Recent History Compilation): Dùng làm TRÍ NHỚ NGẮN HẠN để nắm bắt tình huống hiện tại, cảm xúc và các sự việc vừa xảy ra (5 lượt gần nhất). Đọc kỹ để bắt nhịp ngay lập tức.
-2. TRÁNH LẶP LẠI: TUYỆT ĐỐI không lặp lại các câu văn, tính từ hoặc mô tả đã xuất hiện trong "Bối Cảnh Gần Đây". Hãy tiếp nối diễn biến thay vì kể lại dông dài.
-3. LOGIC LIỀN MẠCH & DUY TRÌ LỘ TRÌNH (POST-COMBAT CONTINUITY): 
-   - Nếu lượt vừa rồi MC vừa kết thúc một trận chiến (có thông tin [Chiến Đấu] trong Recent History), AI PHẢI đọc kết quả đó để viết tiếp chương mới.
-   - TRÁNH LỖI LẶP EVENT: Nếu MC đang trên hành trình đi đến một đích đến cụ thể (ví dụ: đang đi về tông môn, đang đi đến thành thị), sau khi thắng trận chiến, AI nên cho MC thực hiện tiếp hoặc hoàn thành hành động đó thay vì chèn thêm các sự kiện ngẫu nhiên mới liên tục trên đường đi. Một hành trình không nên bị ngắt quãng bởi quá nhiều event vụn vặt nếu không cần thiết.
-   - HỆ QUẢ CHIẾN ĐẤU: Miêu tả cảm giác sau trận đánh (mệt mỏi, thu hoạch, thương thế) và sự thay đổi của môi trường xung quanh một cách tự nhiên. Trạng thái NPC cũng phải khớp với kết quả (ví dụ: nếu kẻ địch bị đánh bại thì phải biến mất hoặc nằm gục).
-4. NHẤT QUÁN TRẠNG THÁI TRONG NSFW: Khi ở chế độ NSFW, đặc biệt để ý đến tình trạng cơ thể và trang phục của NPC. Tuyệt đối tránh mô tả không thống nhất giữa các scene (ví dụ: scene trước quần áo rách nát, scene sau lại lành lặn mà không có lý do). Mọi thay đổi về ngoại trạng phải được kế thừa và duy trì hợp lý từ các lượt trước.
-
-[PHẦN 7.1: GIAO THỨC ĐỊNH DẠNG HỘI THOẠI (DIALOGUE FORMATTING)]:
-ĐỂ UI HIỂN THỊ ĐÚNG, TẤT CẢ CÁC CÂU THOẠI HOẶC THÔNG BÁO BẮT BUỘC PHẢI TUÂN THỦ ĐỊNH DẠNG CHÍNH XÁC NHƯ SAU:
-- Bất kỳ câu phát biểu, lời nói nào của nhân vật (kể cả MC), hệ thống, đều PHẢI nằm trên một dòng riêng biệt.
-- Bắt đầu dòng bằng: \`[Tên Nhân Vật]: Nội dung thoại\`
-- Ví dụ 1:
-[Hàn Lập]: Đa tạ tiền bối chỉ điểm!
-- Ví dụ 2:
-[HỆ THỐNG]: Cảnh báo! Linh khí trong cơ thể đang bạo động!
-- NGHIÊM CẤM: Không lồng ghép lời nói vào giữa đoạn văn miêu tả. Mỗi câu nói là một dòng mới với dấu ngoặc vuông tên nhân vật.
-
-[PHẦN 8: QUẢN LÝ BẢN ĐỒ THẾ GIỚI (WORLD MAP MANAGEMENT)]:
-1. CẤU TRÚC 10 TẦNG: Bạn phải tuân thủ 10 tầng địa lý trong WORLD_GEO_PROMPT.
-2. SÁNG TẠO TÊN: Bạn CÓ QUYỀN đặt tên cho các lục địa/vùng đất (vd: thay vì gọi là "Nam Hoang Vực", có thể gọi là "Vạn Độc Xà Đảo"). Tuy nhiên, bản chất địa lý và giới hạn tu vi PHẢI giữ đúng theo Tier đó.
-3. DUY TRÌ NHẤT QUÁN: Khi đã đặt tên cho một vùng đất, hãy giữ nguyên tên đó trong 'mapData' và Story.
-4. CẬP NHẬT MAP: Khi người chơi di chuyển đến vùng đất mới hoặc khám phá ra vị trí mới, PHẢI thêm 'id' của vùng đất đó vào mảng 'playerUpdates.discoveredRegionIds' để mở khóa trên giao diện. (Tuyệt đối KHÔNG trả về mapData).
-5. VỊ TRÍ HIỆN TẠI (DI CHUYỂN): Khi nhân vật đến một địa điểm mới, BẮT BUỘC cập nhật trường 'playerUpdates.locationUpdate' bằng ID hoặc TÊN của vùng đất đó, đồng thời cập nhật 'playerUpdates.positionX' và 'playerUpdates.positionY' nếu có thể.
-6. CẢNH GIỚI TRẦN: Mỗi vùng đất phải giữ nguyên 'cap' (cảnh giới tối đa) và 'linhKhi' theo đúng WORLD_GEO_PROMPT để đảm bảo logic thăng tiến.
-7. PHÁT HIỆN TÔNG MÔN/TỔ CHỨC: Khi có sự kiện liên quan, người chơi nghe danh, hoặc gặp gỡ đệ tử của một Tông môn hoặc Tổ chức mới, BẮT BUỘC thêm tên của Tông môn/Tổ chức đó vào mảng 'playerUpdates.knownFactionsAdd' để hệ thống mở khóa thông tin gốc của thế giới cho người chơi.
-
-[PHẦN 9: LINH BẢO, CÔNG PHÁP, NPC & YÊU THÚ KẾ THỪA TỪ THẾ GIỚI]:
-1. THẾ GIỚI ĐÃ CÓ SẴN DỮ LIỆU: Hệ thống đã tạo ra sẵn các mảng dữ liệu khổng lồ gồm worldNPCs, worldEquipments, worldTechniques, worldBeasts để xây dựng thế giới đa dạng ngay từ khi bắt đầu.
-2. ƯU TIÊN SỬ DỤNG: Khi bạn cần cho MC gặp gỡ NPC mới, nhặt được vũ khí, kỳ ngộ công pháp, hay đối đầu với yêu thú... Hãy tìm kiếm và lấy trực tiếp thông tin từ các mảng dữ liệu Toàn Thế Giới đó thay vì tự nghĩ ra cái mới hoàn toàn.
-3. TÍNH NHẤT QUÁN: Việc lấy cốt truyện, thuộc tính, và các chi tiết từ danh sách đã tạo sẵn sẽ giúp thế giới liền mạch, MC giống như đang ở trong một vũ trụ có thật với các "kỳ ngộ" đã được định mệnh giăng sẵn.
-4. NGOẠI LỆ: Bạn CHỈ nên tự sinh ra thứ mới nếu tình huống truyện đòi hỏi một thứ cực kỳ đặc thù mà trong kho dữ liệu Toàn Thế Giới không có.
-
-[PHẦN 10: SINH TRANG BỊ VÀ CÔNG PHÁP MỚI (NẾU CẦN)]:
-
-- Khi Story dẫn đến việc MC nhận được kỳ ngộ, hoặc tìm thấy dị bảo, ưu tiên lấy từ 'worldEquipments'. Nếu không phù hợp có thể tạo mới qua trường 'newEquipment'.
-
-[PHẦN 11: HỆ THỐNG CÔNG PHÁP & SỨC MẠNH (CULTIVATION & POWER SCALE)]:
-${CULTIVATION_SYSTEM_PROMPT}
-
-${STATE_SYNC_PROMPT}
-
-[PHẦN 11.1: QUY TẮC KHỞI ĐẦU (PHÀM NHÂN TO TU TIÊN)]:
-1. NHÂN VẬT MỚI: Luôn bắt đầu là "Phàm Nhân" (Realm level 0).
-2. TU TIÊN: Nhân vật CHỈ CÓ THỂ lên cấp "Luyện Khí Kỳ" (Realm level 1) sau khi học được một "Công Pháp" (Cultivation Technique).
-3. HÀNH ĐỘNG KHỞI ĐẦU: Khi là Phàm Nhân, các hành động gợi ý (actions) nên tập trung vào việc tìm kiếm cơ duyên, bị người khác ức hiếp, hoặc đi tìm tông môn.
-4. CHIẾN ĐẤU: Phàm Nhân rất yếu, chỉ có thể đánh nhau với lưu manh hoặc dã thú nhỏ. Tuyệt đối không để Phàm Nhân thắng được yêu thú cấp cao mà không có kỳ ngộ.
-5. TRẢ VỀ CÔNG PHÁP: Khi MC đạt được kỳ ngộ và nhận công pháp đầu tiên, hãy trả về dữ liệu 'newTechnique'. Hệ thống sẽ tự động nâng cấp cảnh giới lên Luyện Khí cho MC.
-
-[PHẦN 11: THỜI GIAN TRÔI QUA & HỆ THỐNG THỜI GIAN]
-Khi người chơi thực hiện hành động, bạn PHẢI dự đoán lượng thời gian đã trôi qua và điền vào 'timePassed':
-- 'unit': CHỈ DÙNG các đơn vị ["nhất tức", "trụ hương", "canh giờ", "ngày", "tuần", "tháng", "năm", "đại vận"].
-- 'value': Số lượng (Ví dụ: 3, 5, 10).
-- ĐỒNG BỘ THỜI GIAN VÀ KHOẢNG CÁCH: Nếu có sự thay đổi về vị trí địa lý (tọa độ X, Y), 'timePassed' PHẢI TƯƠNG XỨNG với quãng đường đã di chuyển. Một người Phàm đi trăm dặm mất vài tuần, Kim Đan bay vạn dặm mất vài ngày.
-- Gợi ý: Chạy trốn/Chiến đấu (1-5 canh giờ/trụ hương). Tĩnh tọa đường ngắn (vài ngày). Bế quan hoặc đi đường dài (vài tháng/vài năm). Tu sĩ đắc đạo bế quan có thể tốn hàng chục năm.
-
-[PHẦN 12: HỆ THỐNG CHỈ SỐ CỐT LÕI (CORE STATS SYSTEM)]:
-- Chỉ số của NPC và Yêu thú PHẢI được tính toán dựa trên Cảnh giới (realmLevel) tương tự như người chơi:
-  - realmScale = 1 + Power(realmLevel, 1.3)
-  - HP = (100 + Thể chất * 10 + Căn cơ * 5) * realmScale
-  - MP = (50 + Thần thức * 12 + Căn cơ * 4) * (1 + Power(realmLevel, 1.4))
-  - ATK = (20 + Thần thức * 6 + Thể chất * 4) * (1 + Power(realmLevel, 1.25))
-  - DEF = (15 + Thể chất * 8 + Căn cơ * 6) * (1 + Power(realmLevel, 1.35))
-- RIÊNG YÊU THÚ: Chỉ số HP sẽ cao hơn từ 1.1 đến 2.0 lần tùy thuộc vào độ tinh khiết của Huyết mạch (bloodline 0.0 - 1.0).
-- Khi khởi tạo nhân vật hoặc có sự thay đổi lớn về tư chất (ngộ đạo, tẩy tủy, trọng sinh), bạn PHẢI cập nhật các chỉ số trong 'playerUpdates':
-  - body (Thể chất), spirit (Thần thức), foundation (Căn cơ): 0-100.
-  - spiritualRoot (Linh căn): { purity: 0-100, type: string }.
-  - talent (Thiên phú), linhCan (Loại linh căn): mô tả bằng văn bản.
-- Luôn đảm bảo sự nhất quán giữa Story và dữ liệu JSON. Nếu trong Story nói MC "căn cơ vững chắc", thì 'foundation' phải cao.
-
-[PHẦN 12: HỆ THỐNG CHIẾN ĐẤU & NGUYÊN TỐ (COMBAT & ELEMENT SYSTEM)]:
-1. NGUYÊN TỐ: KIM, MOC, THUY, HOA, THO, LOI, BANG, PHONG, QUANG, AM, KHONG_GIAN, THOI_GIAN, SINH_TU, HU_VO.
-2. CHIẾU THỨC (Skills): Khi tạo kỹ năng chiến đấu cho MC, PHẢI lưu vào mảng 'playerUpdates.combatSkillsAdd' (KHÔNG dùng mảng skillsAdd). Khi tạo kỹ năng chiến đấu cho yêu thú/NPC, dùng mảng 'skills' của đối tượng đó.
-   - CÂN BẰNG: Sát thương cao (Damage) phải đi kèm Tiêu hao lớn (Cost) hoặc Hồi chiêu lâu (Cooldown).
-   - ĐỊNH DANH: Tên chiêu thức PHẢI là Tiếng Việt hoặc Hán Việt mang phong vị Tu Tiên (VD: Thiên Kiếm Thuật, Huyết Đao Chém, Vạn Tượng Chưởng). TUYỆT ĐỐI KHÔNG DÙNG TIẾNG ANH. Tránh các tên hiện đại hoặc quá nôm na.
-   - PHỔ QUÁT: Kỹ năng có thể là Đơn mục tiêu (SINGLE) hoặc Diện rộng (AOE).
-   - PHẨM CẤP (Rarity): Phẩm cấp COMMON (Scaling: 1.0 - 1.2), RARE (1.2 - 1.6), EPIC (1.6 - 2.2), LEGENDARY (2.2 - 3.5), MYTHIC (3.5+).
-   - UY LỰC (Scaling): Đây là một HỆ SỐ thập phân (ví dụ: 1.2, 1.5, 3.2...). Sát thương = (Attack * Scaling) + BaseDamage. KHÔNG dùng dạng phần trăm.
-   - LƯU Ý VỀ MÔ TẢ: Thuộc tính 'description' PHẢI NGẮN GỌN, VIẾT BẰNG CHỮ, KO GHI CÁC HÀM HOẶC THÔNG SỐ TOÁN HỌC. MIÊU TẢ HIỆU ỨNG TRỰC QUAN THEO CÁCH TIÊN HIỆP (vd: "Thân dung thiên địa, giảm mọi thương tổn", KHÔNG VIẾT "reduceDamage: func()").
-3. KHẮC CHẾ & PHẢN ỨNG: Sử dụng logic tương tác của ELEMENT_SYSTEM (MOC > THO > THUY > HOA > KIM > MOC). Miêu tả rõ các hiệu ứng: BURN, FREEZE, STUN, CURSE, SLOW, POISON, BLEED, FORTIFY, REGEN.
-4. MIÊU TẢ CHIẾN ĐẤU: Tăng mật độ mô tả các chi tiết kỹ thuật (ch[PHẦN 16: HỆ THỐNG THIÊN THỜI & ĐẠO VẬN (HEAVENLY CYCLE)]:
-1. Thiên thời vận hành theo chu kỳ Linh Khí (Linh khí suy -> Linh khí tăng -> Cực thịnh -> Suy tàn).
-2. Khi Linh khí ở mức thấp (SPIRIT_LOW), tu luyện sẽ khó khăn hơn, các kỳ ngộ ít hơn, nhưng có thể tìm thấy các bí bảo cổ xưa trỗi dậy.
-3. Khi Linh khí Cực thịnh (SPIRIT_PEAK), đây là thời đại hoàng kim, dễ dàng đột phá, tu thành đại năng, các thiên tài trỗi dậy như nấm.
-4. CÁC SỰ KIỆN ĐẠO (Dao Events): Nếu có sự kiện đang diễn ra (Tribulation, Secret Realm, Ancient Awaken, ...), bạn PHẢI lồng ghép chúng vào story:
-   - TRIBULATION: Thiên kiếp giáng lâm, nguy cơ tăng cao.
-   - SECRET_REALM: Bí cảnh xuất thế, cơ hội tìm thấy dị bảo.
-   - ANCIENT_AWAKEN: Di tích cổ thức tỉnh, hung hiểm vạn phần.
-   - HEAVENLY_OPPORTUNITY: Cơ duyên lớn từ trời ban.
-
-[PHẦN 17: QUẢN LÝ VẬT PHẨM & TRANG BỊ (ITEM & EQUIPMENT MANAGEMENT)]:
-1. ĐỒNG BỘ HÀNH ĐỘNG: Bất cứ khi nào trong 'story' bạn miêu tả việc người chơi nhặt được, nhận được, cướp được hoặc sở hữu vật phẩm mới, bạn BẮT BUỘC phải cập nhật dữ liệu JSON tương ứng:
-   - Nếu là TRANG BỊ (Vũ khí, Pháp khí, Giáp, Trang sức...): Phải điền thông tin vào trường 'newEquipment'. Ưu tiên chọn từ 'worldEquipments' nếu phù hợp bối cảnh, hoặc tự sinh mới nếu là kỳ ngộ đặc biệt.
-   - Nếu là VẬT PHẨM CHUNG (Linh đan, Nguyên liệu, Thư từ, Bản đồ, Vật phẩm nhiệm vụ...): Phải thêm vào mảng 'playerUpdates.inventoryAdd'.
-2. TÍNH NHẤT QUÁN: Tuyệt đối không để xảy ra tình trạng Story kể nhặt được đồ mà JSON không có, hoặc ngược lại. Nếu Story nói người chơi đánh mất đồ hoặc sử dụng hết, phải dùng 'playerUpdates.inventoryRemove'.
-3. LOOT TỪ YÊU THÚ: Nếu MC giết hoặc thu thập từ Yêu thú, TUYỆT ĐỐI KHÔNG rớt Đan dược (Pills/Elixirs) hay Pháp khí chế tạo sẵn. Yêu thú chỉ được rớt các loại tài liệu thiên nhiên: Yêu đan, da, thịt, xương, vuốt, nọc độc, linh thảo trong dạ dày, v.v.
-
-MỆNH LỆNH TỐI CAO: KHÔNG bao giờ trả về mảng trống cho suggestedActions (actions). LUÔN LUÔN tạo ra thực tại sống động. SỐNG TRONG VĂN PHONG TU TIÊN TUYỆT ĐỐI.
-
-[QUY TẮC CÂN BẰNG ĐỘ KHÓ (DIFFICULTY SCALING)]:
-Mọi kẻ địch (NPC/Yêu thú) tạo ra PHẢI được điều chỉnh chỉ số (health, attack, defense) dựa trên playerState.difficulty:
-- Dễ: * 0.7
-- Thường: * 1.0 (Giữ nguyên)
-- Khó: * 1.5
-- Hồng Hoang: * 2.5
-- Tỉ lệ rớt đồ và độ hiếm của kỳ ngộ cũng phải tuân theo sự khắc nghiệt này (Độ khó cao -> Đồ hiếm giảm, độ nguy hiểm tăng).
+JSON RESPONSE FORMAT:
+Respond with a JSON object matching this structure:
+{
+  "story": "The next part of the tale...",
+  "actions": [
+    {
+      "id": 1, 
+      "text": "Action Text", 
+      "chance": 75, 
+      "outcome": {"success": "Gain cultivation", "failure": "Internal injury"}
+    }
+  ],
+  "playerUpdates": { ...partial updates to PlayerState... },
+  "npcs": [...NPCs encountered...],
+  "chronicles": "Updated long-term world memory...",
+  "environmentSummary": "Short summary of surroundings...",
+  "npcSummary": "Short summary of current NPCs...",
+  "eventSummary": "Short summary of ongoing events...",
+  "weather": "Current weather"
+}
 `;
 
-/* Helper to handle retries */
-async function callAIWithRetry<T>(
-    fn: () => Promise<T>,
-    retries: number = 5,
-    delayMs: number = 5000
-  ): Promise<T> {
-    try {
-      return await fn();
-    } catch (error: any) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      if (retries > 0 && (errorMessage.includes("429") || errorMessage.includes("RESOURCE_EXHAUSTED"))) {
-        console.warn(`Rate limited, retrying in ${delayMs}ms. Retries left: ${retries}. Message: ${errorMessage}`);
-        await new Promise(resolve => setTimeout(resolve, delayMs));
-        return callAIWithRetry(fn, retries - 1, delayMs * 2); // Exponential backoff
-      }
-      throw error;
-    }
-  }
-
-export async function generateWorldMap(apiKey?: string, starterOnly: boolean = false): Promise<MapRegion[]> {
-  try {
-    const rawApiKey = apiKey || process.env.GEMINI_API_KEY || "";
-    const cleanApiKey = rawApiKey.replace(/[^\x20-\x7E]/g, "").trim();
-    if (!cleanApiKey) {
-      throw new Error("API Key is missing or invalid.");
-    }
-    const customAi = new GoogleGenAI({ apiKey: cleanApiKey });
-    
-    const prompt = starterOnly 
-      ? `Tạo ra dữ liệu JSON của LỤC ĐỊA KHỞI ĐẦU (Phàm Giới) bao gồm CHỈ 1-2 điểm (1 lục địa và 1 điểm báo danh) gần với vị trí người chơi nhất. TRẢ VỀ RẤT NGẮN GỌN. KHÔNG TẠO NHIỀU HƠN 2 KHU VỰC. \n${WORLD_GEO_PROMPT}`
-      : WORLD_GEO_PROMPT;
-
-    return await callAIWithRetry(async () => {
-      const response = await customAi.models.generateContent({
-        model: 'gemini-3-flash-preview',
-        contents: [
-          { role: 'user', parts: [{ text: prompt }] }
-        ]
-      });
-      
-      let text = response.text || "[]";
-      text = text.replace(/,(\s*[\]}])/g, '$1');
-      const jsonMatch = text.match(/\[[\s\S]*\]/);
-      if (jsonMatch) {
-        text = jsonMatch[0];
-      }
-      
-      return JSON.parse(text) as MapRegion[];
-    });
-  } catch (error) {
-    console.error("Error generating world map:", error);
-    return []; // Return empty or a fallback map
-  }
-}
-
-export async function generateWorldEquips(apiKey?: string, count: number = 20): Promise<Equipment[]> {
-  try {
-    const rawApiKey = apiKey || process.env.GEMINI_API_KEY || "";
-    const cleanApiKey = rawApiKey.replace(/[^\x20-\x7E]/g, "").trim();
-    if (!cleanApiKey) throw new Error("API Key is missing or invalid.");
-    
-    const customAi = new GoogleGenAI({ apiKey: cleanApiKey });
-    const prompt = EQUIP_RULES_PROMPT.replace('{{item_theme}}', 'Tu tiên thế giới - trang bị ngẫu nhiên rải rác từ Phàm đến Thiên cấp');
-
-    return await callAIWithRetry(async () => {
-      const response = await customAi.models.generateContent({
-        model: 'gemini-3-flash-preview',
-        contents: [{ role: 'user', parts: [{ text: prompt }] }],
-        config: {
-          responseMimeType: "application/json",
-        }
-      });
-      
-      let text = response.text || "{}";
-      // Ensure we have a valid format, wrap as array if needed as per schema it returns one JSON objet
-      if (!text.trim().startsWith('[')) text = `[${text}]`;
-
-      text = text.replace(/,(\s*[\]}])/g, '$1');
-      const jsonMatch = text.match(/\[[\s\S]*\]/);
-      if (jsonMatch) text = jsonMatch[0];
-      
-      const parsedItems = JSON.parse(text) as Equipment[];
-      const canonicalItems = canonicalizeItems(parsedItems);
-      
-      // Flatten canonical items back to Equipment[], taking the first variant
-      return canonicalItems.map(ci => ({
-        ...ci.baseAttributes,
-        name: ci.name,
-        type: ci.type,
-        sentience: ci.variants[0].sentience,
-        evolution_paths: ci.variants[0].evolution_paths,
-        fate_quest: ci.variants[0].fate_quest,
-        lore_hook: ci.variants[0].lore_hook
-      } as Equipment));
-    });
-  } catch (error) {
-    console.error("Error generating world equips:", error);
-    return [];
-  }
-}
-
-export async function generateWorldTechniques(apiKey?: string, count: number = 20): Promise<CultivationTechnique[]> {
-  try {
-    const rawApiKey = apiKey || process.env.GEMINI_API_KEY || "";
-    const cleanApiKey = rawApiKey.replace(/[^\x20-\x7E]/g, "").trim();
-    if (!cleanApiKey) throw new Error("API Key is missing or invalid.");
-    
-    const customAi = new GoogleGenAI({ apiKey: cleanApiKey });
-    const prompt = `Bạn là hệ thống diễn hóa Công Pháp Tu Chân. Hãy tạo ra MỘT MẢNG JSON (JSON Array) gồm ${count} bộ Công Pháp rải rác từ Phàm Cấp đến Đạo Cấp.
-MỆNH LỆNH NGÔN NGỮ TUYỆT ĐỐI (ABSOLUTE LANGUAGE COMMAND): Mọi nội dung text (Tên, Nguồn gốc, Đặc tính, Hướng đột biến...) PHẢI 100% bằng Tiếng Việt hoặc Hán Việt. NGHIÊM CẤM DÙNG TIẾNG ANH. Các giá trị ENUM định sẵn như path, tier, focus, element thì có thể dùng tiếng Anh nếu quy định, nhưng field hiển thị phải là tiếng Việt.
-ĐẢM BẢO CHỈ TRẢ VỀ JSON ARRAY CHUẨN. TẤT CẢ CÁC THUỘC TÍNH PHẢI ĐÚNG ĐỊNH DẠNG JSON. KHÔNG DÙNG CHÚ THÍCH TRONG JSON.
-Cấu trúc object (CultivationTechnique):
-{
-  "id": "chuỗi định danh duy nhất tiếng anh không dấu",
-  "name": "Tên Công Pháp",
-  "tier": "Chọn 1: Phàm, Linh, Huyền, Địa, Thiên, Đạo",
-  "path": "Chọn 1: Chính, Ma, Thể, Hồn, Kiếm, Dị",
-  "element": ["Fire", "Water"],
-  "level": 1,
-  "maxLevel": 9,
-  "experience": 0,
-  "isActive": false,
-  "core": {
-    "origin": "Nguồn gốc bộ công pháp",
-    "characteristics": "Đặc tính",
-    "focus": "Chọn 1: Body, Spirit, Foundation, Balanced"
-  },
-  "circulation": {
-    "type": "Chọn 1: Tiểu Chu Thiên, Đại Chu Thiên, Nghịch",
-    "efficiency": 1.5
-  },
-  "effects": {
-    "passive": ["Nội tại 1"],
-    "active": ["Chủ động 1"]
-  },
-  "cost": {
-    "risk": "Rủi ro tẩu hoả nhập ma",
-    "lifespan": 10,
-    "requirements": ["Yêu cầu 1"]
-  },
-  "mastery": {
-    "refinement": 0,
-    "application": 0
-  },
-  "evolution": {
-    "canMutate": true,
-    "direction": ["Hướng đột biến"]
-  }
-}`;
- 
-    return await callAIWithRetry(async () => {
-      const response = await customAi.models.generateContent({
-        model: 'gemini-3.1-pro-preview',
-        contents: [{ role: 'user', parts: [{ text: prompt }] }],
-        config: {
-          responseMimeType: "application/json",
-        }
-      });
-      
-      let text = response.text || "[]";
-      text = text.replace(/,(\s*[\]}])/g, '$1');
-      const jsonMatch = text.match(/\[[\s\S]*\]/);
-      if (jsonMatch) text = jsonMatch[0];
-      
-      return JSON.parse(text) as CultivationTechnique[];
-    });
-  } catch (error) {
-    console.error("Error generating world techniques:", error);
-    return [];
-  }
-}
-
-
-export async function generateWorldNPCs(apiKey?: string, count: number = 20): Promise<NPC[]> {
-  try {
-    const rawApiKey = apiKey || process.env.GEMINI_API_KEY || "";
-    const cleanApiKey = rawApiKey.replace(/[^\x20-\x7E]/g, "").trim();
-    if (!cleanApiKey) throw new Error("API Key is missing or invalid.");
-    
-    const customAi = new GoogleGenAI({ apiKey: cleanApiKey });
-    const prompt = `Bạn là hệ thống tạo hóa NPC Tu Chân Giới. Hãy tạo ra MỘT MẢNG JSON (JSON Array) gồm ${count} NPC có tính cách riêng biệt, rải rác ở khắp các môn phái và cảnh giới trong thiên hạ (từ Phàm Nhân, Luyện Khí đến Hóa Thần, Luyện Hư...).
-MỆNH LỆNH NGÔN NGỮ TUYỆT ĐỐI (ABSOLUTE LANGUAGE COMMAND): Mọi nội dung text (Tên, Biệt danh, Tính cách, Lời nói...) PHẢI 100% bằng Tiếng Việt hoặc Hán Việt. NGHIÊM CẤM DÙNG TIẾNG ANH (trừ các field là json key/id).
-ĐẢM BẢO CHỈ TRẢ VỀ JSON ARRAY. KHÔNG DÙNG CHÚ THÍCH TRONG JSON. TẤT CẢ THUỘC TÍNH PHẢI ĐÚNG ĐỊNH DẠNG JSON.
-Cấu trúc object (NPC):
-{
-  "id": "chuỗi định danh duy nhất tiếng anh không dấu",
-  "name": "Tên NPC",
-  "temporaryName": "Biệt danh tạm thời (Kẻ khả nghi...)",
-  "isNameRevealed": true,
-  "alias": "Ngoại hiệu",
-  "age": 20,
-  "gender": "Chọn: Nam, Nữ",
-  "style": "Đạo bào, Hắc y...",
-  "powerLevel": "Chiến lực mô tả ngắn",
-  "realm": "Cảnh giới (vd: Kim Đan sơ kỳ)",
-  "personality": "Tính cách bề ngoài",
-  "innerSelf": "Bản chất/Khao khát bên trong",
-  "background": "Xuất thân",
-  "faction": "Tông môn/Thế lực",
-  "alignment": "Môn quy/Niềm tin đạo đức",
-  "positionX": 100,
-  "positionY": 200,
-  "relationship": 0,
-  "virginity": "Mô tả nếu có",
-  "currentOutfit": "Trang phục",
-  "bodyDescription": {},
-  "libido": 10,
-  "willpower": 80,
-  "lust": 10,
-  "fetish": "",
-  "sexualPreferences": [],
-  "sexualArchetype": "",
-  "physicalLust": "",
-  "soulAmbition": "Khát vọng thăng tiên...",
-  "shortTermGoal": "Mục tiêu ngắn hạn",
-  "longTermDream": "Mục tiêu dài hạn",
-  "mood": "Tâm trạng hiện tại",
-  "impression": "Ấn tượng",
-  "currentOpinion": "Quan điểm",
-  "witnessedEvents": [],
-  "knowledgeBase": ["Kiến thức võ học"],
-  "conditions": [],
-  "network": [],
-  "type": "Cố nhân, Tán tu, Ma tu...",
-  "inventory": [],
-  "skills": [],
-  "combatSkills": [
-    { "id": "skill_1", "name": "Tên chiêu thức", "baseDamage": 50, "cost": 20, "element": "HOA", "rarity": "COMMON", "targetType": "SINGLE" }
-  ],
-  "voice": "Trầm ổn...",
-  "aura": "Sát khí, Kiếm ý...",
-  "physiologicalResponse": "Bình thản",
-  "readinessState": "Đề phòng",
-  "iq": 120,
-  "mindset": "Logic tu tiên",
-  "signaturePose": "Chạm kiếm tay trái",
-  "sensitivePoints": "",
-  "secrets": "Bí mật che giấu",
-  "status": "alive",
-  "maxHealth": "(Tính theo công thức HP [Phần 12])",
-  "health": "(Tính theo công thức HP [Phần 12])",
-  "maxMana": "(Tính theo công thức MP [Phần 12])",
-  "mana": "(Tính theo công thức MP [Phần 12])",
-  "attack": "(Tính theo công thức ATK [Phần 12])",
-  "defense": "(Tính theo công thức DEF [Phần 12])",
-  "speed": 15,
-  "accuracy": 70,
-  "powerScore": 1000
-}`;
-
-    return await callAIWithRetry(async () => {
-      const response = await customAi.models.generateContent({
-        model: 'gemini-3.1-pro-preview',
-        contents: [{ role: 'user', parts: [{ text: prompt }] }],
-        config: {
-          responseMimeType: "application/json",
-        }
-      });
-      
-      let text = response.text || "[]";
-      text = text.replace(/,(\s*[\]}])/g, '$1');
-      const jsonMatch = text.match(/\[[\s\S]*\]/);
-      if (jsonMatch) text = jsonMatch[0];
-      
-      const parsedNPCs = JSON.parse(text) as NPC[];
-      return parsedNPCs.map(npc => ({
-        ...npc,
-        willpower: clamp(npc.willpower, 0, 100)
-      }));
-    });
-  } catch (error) {
-    console.error("Error generating world NPCs:", error);
-    return [];
-  }
-}
-
-export async function generateWorldBeasts(apiKey?: string, count: number = 20): Promise<any[]> {
-  try {
-    const rawApiKey = apiKey || process.env.GEMINI_API_KEY || "";
-    const cleanApiKey = rawApiKey.replace(/[^\x20-\x7E]/g, "").trim();
-    if (!cleanApiKey) throw new Error("API Key is missing or invalid.");
-    
-    const customAi = new GoogleGenAI({ apiKey: cleanApiKey });
-    const prompt = `Bạn là hệ thống tạo hóa Yêu Thú. Hãy tạo ra MỘT MẢNG JSON (JSON Array) gồm ${count} loại Yêu Thú, Linh Thú, Dị Thú phân bổ trên thiên hạ.
-MỆNH LỆNH NGÔN NGỮ TUYỆT ĐỐI (ABSOLUTE LANGUAGE COMMAND): Mọi nội dung text (Tên, Mô tả, Sinh cảnh, Thu thập...) PHẢI 100% bằng Tiếng Việt hoặc Hán Việt. NGHIÊM CẤM DÙNG TIẾNG ANH (trừ các trường JSON ID kỹ thuật).
-ĐẢM BẢO CHỈ TRẢ VỀ JSON ARRAY CHUẨN. KHÔNG DÙNG CHÚ THÍCH.
-Cấu trúc object (BeastDefinition):
-{
-  "id": "chuỗi định danh duy nhất tiếng anh không dấu",
-  "name": "Tên loại yêu thú",
-  "level": 5,
-  "diet": "Chọn: herbivore, carnivore, omnivore, spiritual_energy, minerals, blood",
-  "basePower": 1.5,
-  "reproduction": 0.5,
-  "rarity": "Chọn: common, rare, elite, boss",
-  "habitat": ["Rừng rậm", "Băng nguyên"],
-  "instinct": {
-    "hunger": 0.5,
-    "aggression": 0.5,
-    "caution": 0.5,
-    "territorial": 0.5,
-    "pack": 0.5,
-    "bloodline": 0.5
-  },
-  "description": "Mô tả đặc điểm sinh học và chiến đấu",
-  "element": "Chọn 1: KIM, MOC, THUY, HOA, THO, PHONG, LOI, BANG, AM, QUANG",
-  "drops": ["Tên nguyên liệu 1 (TUYỆT ĐỐI KHÔNG rớt đan dược hay pháp khí)", "Yêu đan"],
-  "stats": {
-    "health": "(Tính theo công thức HP [Phần 12] * 1.1-2.0 tùy bloodline)",
-    "maxHealth": "(Tính theo công thức HP [Phần 12] * 1.1-2.0 tùy bloodline)",
-    "attack": "(Tính theo công thức ATK [Phần 12])",
-    "defense": "(Tính theo công thức DEF [Phần 12])",
-    "speed": 60,
-    "accuracy": 65,
-    "mana": "(Tính theo công thức MP [Phần 12])",
-    "maxMana": "(Tính theo công thức MP [Phần 12])"
-  },
-  "talents": [
-    { "id": "talent_1", "name": "Tên thiên phú (vd: Phong Nhận)", "baseDamage": 80, "cost": 30, "element": "PHONG", "rarity": "COMMON", "targetType": "SINGLE", "description": "Mô tả chiêu thức" }
-  ],
-  "status": "alive"
-}`;
-
-    return await callAIWithRetry(async () => {
-      const response = await customAi.models.generateContent({
-        model: 'gemini-3.1-pro-preview',
-        contents: [{ role: 'user', parts: [{ text: prompt }] }],
-        config: {
-          responseMimeType: "application/json",
-        }
-      });
-      
-      let text = response.text || "[]";
-      text = text.replace(/,(\s*[\]}])/g, '$1');
-      const jsonMatch = text.match(/\[[\s\S]*\]/);
-      if (jsonMatch) text = jsonMatch[0];
-      
-      return JSON.parse(text) as any[];
-    });
-  } catch (error) {
-    console.error("Error generating world beasts:", error);
-    return [];
-  }
-}
-
-
 export async function generateNextStep(
-  playerState: any,
+  playerState: PlayerState,
   lastActionText: string,
   history: { role: string, content: string }[]
 ): Promise<GameResponse> {
   try {
-    const rawApiKey = playerState.customApiKey || process.env.GEMINI_API_KEY || "";
-    // Clean API key from any non-ISO-8859-1 characters that would break Headers.append
-    const apiKey = rawApiKey.replace(/[^\x20-\x7E]/g, "").trim();
+    const apiKey = playerState.customApiKey || "";
     
-    if (!apiKey) {
-      throw new Error("API Key is missing or invalid.");
-    }
+    const recentHistory = history.slice(-5).map(h => `${h.role === 'user' ? 'Hành động' : 'Diễn biến'}: ${h.content}`).join('\n\n');
     
-    const customAi = new GoogleGenAI({ apiKey });
+    const nsfwInstruction = playerState.isNsfwEnabled 
+      ? 'ĐÃ BẬT. Ngươi ĐƯỢC PHÉP và ĐƯỢC KHUYẾN KHÍCH mô tả các cảnh 18+ với phong cách truyện 18+ ( các tình tiết vượt chuẩn mực đạo đức được cho phép vì đây là giả tưởng là truyện 18+ người dùng đã được xác minh 21+, các nhân vật đã đủ tuổi và đã tự nguyên chấp nhận), các đại từ chỉ bộ phận sinh dục sẽ được ẩn dụ thành cu tức là dương vật và lồn tức là âm đạo và dú tức là vú, ngoài ra đa dạng sử dụng ngôn từ biểu thị bộ phận sinh dục sao cho hấp dẫn và tự nhiên nhất, như dương vật, cặc, đầu khấc, hòn dái, bi, âm vật, lỗ đít, lỗ hậu, tử cung, bầu ngực..., và cảnh quan hệ được nói một cách nghệ thuật, các cảnh máu me giết chóc cũng sẽ nói trực diện.' 
+      : 'ĐÃ TẮT. Tránh xa các chủ đề nhạy cảm.';
+    
+    const scenePopupInstruction = playerState.isScenePopupEnabled
+      ? 'ĐÃ BẬT. Khi có một cảnh quan trọng (ví dụ: chiến đấu, khám phá một địa điểm mới, gặp gỡ NPC quan trọng, sự kiện bất ngờ), hãy sử dụng thẻ [SCENE_DESCRIBE: title="Tiêu đề cảnh", description="Mô tả chi tiết cảnh (2-5 câu, tập trung vào hình ảnh, âm thanh, cảm xúc, không khí)."] để kích hoạt pop-up mô tả cảnh. Đảm bảo mô tả cảnh không trùng lặp với nội dung câu chuyện chính.'
+      : 'ĐÃ TẮT. Không sử dụng thẻ SCENE_DESCRIBE.';
 
-    // Lấy 5 đoạn truyện gần nhất từ history để AI có context rõ ràng hơn
-    const MAX_HISTORY_LENGTH = 5;
-    const recentHistory = history && history.length > 0 
-      ? history.slice(-MAX_HISTORY_LENGTH).map(h => `${h.role === 'user' ? 'Hành động' : 'Diễn biến'}: ${h.content}`).join('\n\n')
-      : "Khởi đầu cuộc hành trình.";
-
-    // Tích hợp hệ thống sự kiện mới
-    const eventGameState: EventGameState = {
-      player: {
-        hp: playerState.health,
-        mp: playerState.mana,
-        realm: playerState.realm,
-        luck: playerState.luck || 0,
-        karma: playerState.karma || 0,
-        position: { x: playerState.positionX || 0, y: playerState.positionY || 0, region: playerState.currentLocation || "Khởi nguyên" },
-        status: []
-      }
-    };
-    const triggeredEvent = triggerEvent(eventGameState);
-    const eventContext = triggeredEvent 
-        ? `SỰ KIỆN GỢI Ý ĐỂ AI DIỄN HÓA:
-           - Tóm tắt: ${triggeredEvent.summary}
-           - Yêu cầu hành động: ${triggeredEvent.startCombat ? "BẮT BUỘC KÍCH HOẠT CHIẾN ĐẤU" : "Diễn giải theo hướng sự kiện này."}
-           `
-        : "";
-
-    // Sect system context
-    const currentSectName = playerState.currentSect;
-    const currentOrgName = playerState.currentOrg;
-    const currentSectData = SECTS.find(s => s.name === currentSectName);
-    const currentOrgData = ORGANIZATIONS.find(o => o.name === currentOrgName);
-    const orgRankName = currentOrgData?.ranks.find(r => r.id === playerState.orgRank)?.name || "Thành viên";
-    const sectInteractions = currentSectName ? getSectInteractions(currentSectName) : null;
-    const sectContext = `
-      THÀNH VIÊN TÔNG MÔN: ${currentSectName || "Chưa gia nhập"}
-      TÔN CHỈ TÔNG MÔN: ${currentSectData?.tenet || "Không"}
-      THÀNH VIÊN TỔ CHỨC: ${currentOrgName || "Không"}
-      TÔN CHỈ TỔ CHỨC: ${currentOrgData?.tenet || "Không"}
-      CẤP BẬC TỔ CHỨC: ${orgRankName} (Cống hiến: ${playerState.orgContribution})
-      CÁP BẬC TÔNG MÔN: ${playerState.sectRank || "Không"}
-      ĐIỂM CỐNG HIẾN TÔNG MÔN: ${playerState.sectContribution || 0}
-      DANH TIẾNG TÔNG MÔN/TỔ CHỨC: ${JSON.stringify(playerState.factionsReputation || {})}
-      ${sectInteractions ? `NHIỆM VỤ KHẢ DỤNG & ĐẶC TRƯNG: ${JSON.stringify(sectInteractions)}` : ""}
-      QUY TẮC CẤP BẬC TÔNG MÔN: ${JSON.stringify(SECT_MECHANICS.ranks)}
-    `;
+    const systemPromptFinal = SYSTEM_PROMPT
+      .replace('{nsfwInstruction}', nsfwInstruction)
+      .replace('{scenePopupInstruction}', scenePopupInstruction)
+      .replace('{talkRules}', TALK_RULES)
+      .replace('{ageRules}', NPC_AGE_RULES)
+      .replace('{sexualPoseRules}', SEXUAL_POSE_RULES);
 
     const context = `
-    ${eventContext}
-    ${sectContext}
-    DỮ LIỆU THIÊN THỜI (HEAVENLY CYCLE):
-    - Chu kỳ: ${JSON.stringify(playerState.timeline?.cycle)}
-    - Các sự kiện Đạo (Active Events): ${JSON.stringify(playerState.timeline?.events?.filter((e: any) => e.active))}
-
-    DỮ LIỆU TÓM TẮT DÀI HẠN (LONG-TERM CONTEXT - CHRONICLES):
-    - Biên Niên Sử (Chronicles): ${playerState.chronicles}
+    TÓM TẮT DÀI HẠN: ${playerState.chronicles}
     
-    TÌNH TRẠNG HIỆN TẠI (INSTANT STATE):
-    - Tên: ${playerState.name}
-    - Giới tính: ${playerState.gender}
-    - Độ khó: ${playerState.difficulty}
-    - Cảnh giới: ${playerState.realm} (${playerState.stage})
-    - Thẻ dữ liệu Yêu Thú Toàn Thế Giới: ${JSON.stringify(playerState.worldBeasts)}
-    - Thẻ dữ liệu NPC Toàn Thế Giới: ${JSON.stringify(playerState.worldNPCs)}
-    - Thẻ dữ liệu Trang Bị Toàn Thế Giới: ${JSON.stringify(playerState.worldEquipments)}
-    - Thẻ dữ liệu Công Pháp Toàn Thế Giới: ${JSON.stringify(playerState.worldTechniques)}
-    - Điểm sức mạnh (Power Score): ${playerState.powerScore}
-    - Thuộc tính cơ bản: Thể chất ${playerState.body}, Thần thức ${playerState.spirit}, Căn cơ ${playerState.foundation}
-    - Linh căn: ${playerState.spiritualRoot?.type || 'Chưa xác định'} (Độ thuần khiết: ${playerState.spiritualRoot?.purity || 0})
-    - Vị Trí Hiện Tại: Bản đồ ${playerState.currentLocation} (Tọa độ X: ${playerState.positionX || 0}, Y: ${playerState.positionY || 0})
-    - Nhiệm vụ đang thực hiện: ${JSON.stringify(playerState.activeMissions || [])}
-    - Địa danh lân cận (Khoảng cách < 200): ${JSON.stringify((playerState.mapData || []).filter(m => Math.sqrt(Math.pow((m.positionX || 0) - (playerState.positionX || 0), 2) + Math.pow((m.positionY || 0) - (playerState.positionY || 0), 2)) < 200).map(m => m.name))}
-    - NPC lân cận từ Thế Giới (Khoảng cách < 200): ${JSON.stringify((playerState.worldNPCs || []).filter(n => Math.sqrt(Math.pow((n.positionX || 0) - (playerState.positionX || 0), 2) + Math.pow((n.positionY || 0) - (playerState.positionY || 0), 2)) < 200).map(n => n.name))}
-    - NPC Hiện Diện (SỐNG): ${JSON.stringify(playerState.npcs.filter((n: any) => n.status !== 'dead'))}
-    - NPC Đã Tử Vong (ĐÃ CHẾT, KHÔNG ĐƯỢC TƯƠNG TÁC): ${JSON.stringify(playerState.npcs.filter((n: any) => n.status === 'dead'))}
-    - Chỉ số MC: HP ${playerState.health}/${playerState.maxHealth}, MP ${playerState.mana}/${playerState.maxMana}, ATK ${playerState.attack}, DEF ${playerState.defense}
-    - Thời tiết: ${playerState.weather}
-    - Bản đồ thế giới hiện tại: ${JSON.stringify(playerState.mapData)}
-    - Hành trang & Kỹ năng: ${JSON.stringify(playerState.inventory)}, ${JSON.stringify(playerState.skills)}
-    - Công pháp đang tu luyện: ${JSON.stringify(playerState.masteredTechniques)}
-    - Trang bị hiện tại: ${JSON.stringify(playerState.equippedItems)}
-    - Chế độ Maturity/Romance (NSFW): ${playerState.isNsfwEnabled ? "BẬT" : "TẮT"}
-    - Yêu cầu độ dài truyện: ${playerState.storyLength === 'Ngắn' ? 'Rất ngắn (khoảng 300-500 từ)' : playerState.storyLength === 'Dài' ? 'Rất dài và chi tiết (trên 2000 từ)' : 'Bình thường (khoảng 1000-1200 từ)'}
+    TÓM TẮT NGẮN HẠN (VUI LÒNG CẬP NHẬT):
+    - Môi trường: ${playerState.environmentSummary || 'Chưa xác định'}
+    - NPC hiện diện: ${playerState.npcSummary || 'Chưa có'}
+    - Sự kiện đang diễn ra: ${playerState.eventSummary || 'Bình lặng'}
 
-    BỐI CẢNH GẦN ĐÂY (RECENT HISTORY COMPILATION):
+    BỐI CẢNH THẾ GIỚI (LORE):
+    - Thế giới: ${playerState.lore?.world || 'Chưa xác định'}
+    - Khởi đầu/Nguồn gốc: ${playerState.lore?.origin || 'Chưa xác định'}
+    - Các Arc/Sự kiện lớn: ${playerState.lore?.majorArcs || 'Chưa xác định'}
+    
+    TÌNH TRẠNG HIỆN TẠI:
+    - Tên: ${playerState.name} - Giới tính: ${playerState.gender}
+    - Cảnh giới: ${playerState.realm} (${playerState.stage})
+    - Chỉ số: HP ${playerState.health}/${playerState.maxHealth}, MP ${playerState.mana}/${playerState.maxMana}, Tu Vi: ${playerState.tuVi}
+    - Vị Trí: ${playerState.currentLocation}
+    - Độ khó: ${playerState.difficulty}
+    - NSFW Mode: ${playerState.isNsfwEnabled ? "ACTIVE" : "OFF"}
+
+    BỐI CẢNH GẦN ĐÂY:
     """
     ${recentHistory}
     """
 
-    HÀNH ĐỘNG MỚI NHẤT CỦA NGƯỜI CHƠI: "${lastActionText}"
-    
-    NHIỆM VỤ: Dựa trên Chronicles để giữ logic chung, nhưng PHẢI bám sát "Bối Cảnh Gần Đây" để tiếp nối câu chuyện một cách mượt mà, không lặp lại từ ngữ và tránh lỗi logic. Hãy diễn hóa tiếp các sự kiện. TRẢ VỀ JSON CHÍNH XÁC.
-    ĐẶC BIỆT CHÚ Ý TỚI CÁC NHIỆM VỤ ĐANG THỰC HIỆN (Active Missions). NẾU có nhiệm vụ đang dang dở, BẮT BUỘC cung cấp ít nhất 1 action (hành động đề xuất) hướng người chơi đi tới địa điểm mục tiêu hoặc thực hiện tiến độ. Ký hiệu là "[Nhiệm Vụ]".
+    HÀNH ĐỘNG MỚI NHẤT: "${lastActionText}"
     `;
 
-    const response = await customAi.models.generateContent({
-      model: "gemini-3-flash-preview",
-      contents: context,
-      config: {
-        systemInstruction: SYSTEM_PROMPT,
-        responseMimeType: "application/json",
-        maxOutputTokens: 8192,
-        responseSchema: {
-          type: Type.OBJECT,
-          required: ["story", "actions"],
-          properties: {
-            story: { type: Type.STRING },
-            triggersCombat: { type: Type.BOOLEAN },
-            enemies: {
-              type: Type.ARRAY,
-              items: {
+    const responseSchemaObj = {
+      type: Type.OBJECT,
+      required: ["story", "actions"],
+      properties: {
+        story: { type: Type.STRING },
+        actions: {
+          type: Type.ARRAY,
+          items: {
+            type: Type.OBJECT,
+            required: ["id", "text"],
+            properties: {
+              id: { type: Type.NUMBER },
+              text: { type: Type.STRING },
+              chance: { type: Type.NUMBER },
+              outcome: {
                 type: Type.OBJECT,
-                required: ["id", "name", "element", "stats", "combatSkills"],
+                required: ["success", "failure"],
                 properties: {
-                  id: { type: Type.STRING },
-                  name: { type: Type.STRING },
-                  element: { type: Type.STRING },
-                  stats: {
-                    type: Type.OBJECT,
-                    required: ["health", "attack", "defense", "speed", "mana"],
-                    properties: {
-                      health: { type: Type.NUMBER },
-                      attack: { type: Type.NUMBER },
-                      defense: { type: Type.NUMBER },
-                      speed: { type: Type.NUMBER },
-                      accuracy: { type: Type.NUMBER },
-                      mana: { type: Type.NUMBER }
-                    }
-                  },
-                  combatSkills: {
-                    type: Type.ARRAY,
-                    items: {
-                      type: Type.OBJECT,
-                      required: ["id", "name", "baseDamage", "scaling", "cost", "cooldown", "element", "targetType", "rarity"],
-                      properties: {
-                        id: { type: Type.STRING },
-                        name: { type: Type.STRING },
-                        baseDamage: { type: Type.NUMBER },
-                        scaling: { type: Type.NUMBER },
-                        cost: { type: Type.NUMBER },
-                        cooldown: { type: Type.NUMBER },
-                        element: { type: Type.STRING },
-                        targetType: { type: Type.STRING, enum: ["SINGLE", "AOE", "SELF"] },
-                        rarity: { type: Type.STRING, enum: ["COMMON", "RARE", "EPIC", "LEGENDARY", "MYTHIC"] },
-                        description: { type: Type.STRING }
-                      }
-                    }
-                  }
-                }
-              }
-            },
-            newEquipment: {
-              type: Type.OBJECT,
-              properties: {
-                name: { type: Type.STRING },
-                rarity: { type: Type.STRING },
-                tier: { type: Type.STRING },
-                realm: { type: Type.STRING },
-                type: { type: Type.STRING },
-                origin: { type: Type.STRING },
-                main_effect: { type: Type.STRING },
-                sub_effect: { type: Type.STRING },
-                restriction: { type: Type.STRING },
-                sentience: {
-                  type: Type.OBJECT,
-                  properties: {
-                    level: { type: Type.STRING },
-                    note: { type: Type.STRING }
-                  }
-                },
-                backlash: { type: Type.STRING },
-                evolution_paths: { type: Type.ARRAY, items: { type: Type.STRING } },
-                fate_quest: {
-                  type: Type.OBJECT,
-                  properties: {
-                    trigger: { type: Type.STRING },
-                    chain: { type: Type.ARRAY, items: { type: Type.STRING } }
-                  }
-                },
-                lore_hook: { type: Type.STRING }
-              }
-            },
-            newTechnique: {
-              type: Type.OBJECT,
-              properties: {
-                name: { type: Type.STRING },
-                tier: { type: Type.STRING },
-                path: { type: Type.STRING },
-                element: { type: Type.ARRAY, items: { type: Type.STRING } },
-                core: {
-                  type: Type.OBJECT,
-                  properties: {
-                    origin: { type: Type.STRING },
-                    characteristics: { type: Type.STRING },
-                    description: { type: Type.STRING },
-                    focus: { type: Type.STRING }
-                  }
-                },
-                circulation: {
-                  type: Type.OBJECT,
-                  properties: {
-                    type: { type: Type.STRING },
-                    efficiency: { type: Type.NUMBER }
-                  }
-                },
-                effects: {
-                  type: Type.OBJECT,
-                  properties: {
-                    passive: { type: Type.ARRAY, items: { type: Type.STRING } },
-                    active: { type: Type.ARRAY, items: { type: Type.STRING } }
-                  }
-                },
-                cost: {
-                  type: Type.OBJECT,
-                  properties: {
-                    risk: { type: Type.STRING },
-                    lifespan: { type: Type.NUMBER },
-                    requirements: { type: Type.ARRAY, items: { type: Type.STRING } }
-                  }
-                },
-                mastery: {
-                  type: Type.OBJECT,
-                  properties: {
-                    refinement: { type: Type.NUMBER },
-                    application: { type: Type.NUMBER }
-                  }
-                },
-                evolution: {
-                  type: Type.OBJECT,
-                  properties: {
-                    canMutate: { type: Type.BOOLEAN },
-                    direction: { type: Type.ARRAY, items: { type: Type.STRING } }
-                  }
-                }
-              }
-            },
-            actions: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                required: ["id", "text"],
-                properties: {
-                  id: { type: Type.NUMBER },
-                  text: { type: Type.STRING },
-                  time: { type: Type.NUMBER }
-                }
-              }
-            },
-            successChance: { type: Type.NUMBER },
-            timePassed: {
-              type: Type.OBJECT,
-              properties: {
-                unit: { type: Type.STRING },
-                value: { type: Type.NUMBER }
-              }
-            },
-            playerUpdates: {
-              type: Type.OBJECT,
-              properties: {
-                tuViChange: { type: Type.NUMBER },
-                healthChange: { type: Type.NUMBER },
-                manaChange: { type: Type.NUMBER },
-                reputationChange: { type: Type.NUMBER },
-                karmaChange: { type: Type.NUMBER },
-                body: { type: Type.NUMBER },
-                spirit: { type: Type.NUMBER },
-                foundation: { type: Type.NUMBER },
-                spiritualRoot: {
-                  type: Type.OBJECT,
-                  properties: {
-                    purity: { type: Type.NUMBER },
-                    type: { type: Type.STRING }
-                  }
-                },
-                talent: { type: Type.STRING },
-                linhCan: { type: Type.STRING },
-                background: { type: Type.STRING },
-                knownFactionsAdd: {
-                  type: Type.ARRAY,
-                  items: { type: Type.STRING }
-                },
-                inventoryAdd: {
-                  type: Type.ARRAY,
-                  items: {
-                    type: Type.OBJECT,
-                    properties: {
-                      name: { type: Type.STRING },
-                      description: { type: Type.STRING },
-                      type: { type: Type.STRING, description: "Type: Đan dược, Vật liệu, Nhiệm vụ..." },
-                      consumableEffects: {
-                        type: Type.OBJECT,
-                        properties: {
-                          hpRestore: { type: Type.NUMBER },
-                          manaRestore: { type: Type.NUMBER },
-                          tuViBonus: { type: Type.NUMBER },
-                          maxHpIncrease: { type: Type.NUMBER },
-                          maxManaIncrease: { type: Type.NUMBER },
-                          breakthroughBonus: { type: Type.NUMBER }
-                        }
-                      }
-                    }
-                  }
-                },
-                inventoryRemove: { type: Type.ARRAY, items: { type: Type.STRING } },
-                missionUpdates: {
-                  type: Type.ARRAY,
-                  items: {
-                    type: Type.OBJECT,
-                    required: ["id"],
-                    properties: {
-                      id: { type: Type.STRING },
-                      status: { type: Type.STRING },
-                      progress: { type: Type.NUMBER },
-                      targetLocation: { type: Type.STRING }
-                    }
-                  }
-                },
-                skillsAdd: {
-                  type: Type.ARRAY,
-                  items: {
-                    type: Type.OBJECT,
-                    properties: {
-                      name: { type: Type.STRING },
-                      description: { type: Type.STRING }
-                    }
-                  }
-                },
-                combatSkillsAdd: {
-                  type: Type.ARRAY,
-                  items: {
-                    type: Type.OBJECT,
-                    required: ["id", "name", "baseDamage", "scaling", "cost", "cooldown", "element", "targetType", "rarity"],
-                    properties: {
-                      id: { type: Type.STRING },
-                      name: { type: Type.STRING },
-                      baseDamage: { type: Type.NUMBER },
-                      scaling: { type: Type.NUMBER },
-                      cost: { type: Type.NUMBER },
-                      cooldown: { type: Type.NUMBER },
-                      element: { type: Type.STRING },
-                      targetType: { type: Type.STRING, enum: ["SINGLE", "AOE", "SELF"] },
-                      rarity: { type: Type.STRING, enum: ["COMMON", "RARE", "EPIC", "LEGENDARY", "MYTHIC"] },
-                      description: { type: Type.STRING }
-                    }
-                  }
-                },
-                locationUpdate: { type: Type.STRING },
-                positionX: { type: Type.NUMBER },
-                positionY: { type: Type.NUMBER },
-                realm: { type: Type.STRING },
-                realmLevel: { type: Type.NUMBER },
-                stage: { type: Type.STRING },
-                tuViCapacity: { type: Type.NUMBER },
-                accuracy: { type: Type.NUMBER },
-                discoveredRegionIds: {
-                  type: Type.ARRAY,
-                  items: { type: Type.STRING }
-                }
-              }
-            },
-            weather: { type: Type.STRING },
-            chronicles: { type: Type.STRING },
-            npcs: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                required: ["id", "name", "status", "health", "maxHealth", "attack", "defense", "speed", "realm"],
-                properties: {
-                  id: { type: Type.STRING },
-                  name: { type: Type.STRING },
-                  age: { type: Type.NUMBER },
-                  realm: { type: Type.STRING },
-                  realmLevel: { type: Type.NUMBER },
-                  faction: { type: Type.STRING },
-                  positionX: { type: Type.NUMBER },
-                  positionY: { type: Type.NUMBER },
-                  temporaryName: { type: Type.STRING },
-                  isNameRevealed: { type: Type.BOOLEAN },
-                  relationship: { type: Type.NUMBER },
-                  status: { type: Type.STRING },
-                  mood: { type: Type.STRING },
-                  lust: { type: Type.NUMBER },
-                  willpower: { type: Type.NUMBER },
-                  libido: { type: Type.NUMBER },
-                  powerScore: { type: Type.NUMBER },
-                  body: { type: Type.NUMBER },
-                  spirit: { type: Type.NUMBER },
-                  foundation: { type: Type.NUMBER },
-                  attack: { type: Type.NUMBER },
-                  defense: { type: Type.NUMBER },
-                  health: { type: Type.NUMBER },
-                  maxHealth: { type: Type.NUMBER },
-                  mana: { type: Type.NUMBER },
-                  maxMana: { type: Type.NUMBER },
-                  speed: { type: Type.NUMBER },
-                  accuracy: { type: Type.NUMBER },
-                  inventory: { 
-                    type: Type.ARRAY, 
-                    items: { 
-                      type: Type.OBJECT,
-                      properties: {
-                        name: { type: Type.STRING },
-                        description: { type: Type.STRING }
-                      }
-                    } 
-                  },
-                  skills: {
-                    type: Type.ARRAY,
-                    items: {
-                      type: Type.OBJECT,
-                      properties: {
-                        name: { type: Type.STRING },
-                        description: { type: Type.STRING }
-                      }
-                    }
-                  },
-                  domain: {
-                    type: Type.OBJECT,
-                    properties: {
-                      name: { type: Type.STRING },
-                      element: { type: Type.STRING },
-                      strength: { type: Type.NUMBER },
-                      stability: { type: Type.NUMBER },
-                      effects: {
-                        type: Type.OBJECT,
-                        properties: {
-                          buffSelf: { type: Type.ARRAY, items: { type: Type.STRING } },
-                          debuffEnemy: { type: Type.ARRAY, items: { type: Type.STRING } }
-                        }
-                      }
-                    }
-                  },
-                  impression: { type: Type.STRING },
-                  currentOpinion: { type: Type.STRING },
-                  iq: { type: Type.NUMBER },
-                  mindset: { type: Type.STRING }
-                }
-              }
-            },
-            currentLocation: { type: Type.STRING },
-            newBeasts: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                required: ["id", "name", "species", "level", "rarity", "element", "stats", "talents"],
-                properties: {
-                  id: { type: Type.STRING },
-                  name: { type: Type.STRING },
-                  species: { type: Type.STRING },
-                  level: { type: Type.NUMBER },
-                  rarity: { type: Type.STRING, enum: ["common", "rare", "elite", "boss"] },
-                  element: { type: Type.STRING },
-                  habitat: { type: Type.ARRAY, items: { type: Type.STRING } },
-                  drops: { type: Type.ARRAY, items: { type: Type.STRING } },
-                  instinct: {
-                    type: Type.OBJECT,
-                    properties: {
-                      hunger: { type: Type.NUMBER },
-                      aggression: { type: Type.NUMBER },
-                      caution: { type: Type.NUMBER },
-                      territorial: { type: Type.NUMBER }
-                    }
-                  },
-                  description: { type: Type.STRING },
-                  stats: {
-                    type: Type.OBJECT,
-                    required: ["health", "maxHealth", "attack", "defense", "speed", "mana", "maxMana"],
-                    properties: {
-                      health: { type: Type.NUMBER },
-                      maxHealth: { type: Type.NUMBER },
-                      attack: { type: Type.NUMBER },
-                      defense: { type: Type.NUMBER },
-                      speed: { type: Type.NUMBER },
-                      accuracy: { type: Type.NUMBER },
-                      mana: { type: Type.NUMBER },
-                      maxMana: { type: Type.NUMBER }
-                    }
-                  },
-                  talents: {
-                    type: Type.ARRAY,
-                    items: {
-                      type: Type.OBJECT,
-                      required: ["id", "name", "baseDamage", "cost", "element", "targetType", "rarity"],
-                      properties: {
-                        id: { type: Type.STRING },
-                        name: { type: Type.STRING },
-                        baseDamage: { type: Type.NUMBER },
-                        cost: { type: Type.NUMBER },
-                        element: { type: Type.STRING },
-                        targetType: { type: Type.STRING },
-                        rarity: { type: Type.STRING },
-                        description: { type: Type.STRING }
-                      }
-                    }
-                  },
-                  status: { type: Type.STRING }
+                  success: { type: Type.STRING },
+                  failure: { type: Type.STRING }
                 }
               }
             }
           }
-        }
+        },
+        playerUpdates: { type: Type.OBJECT },
+        npcs: { type: Type.ARRAY, items: { type: Type.OBJECT } },
+        chronicles: { type: Type.STRING },
+        environmentSummary: { type: Type.STRING },
+        npcSummary: { type: Type.STRING },
+        eventSummary: { type: Type.STRING },
+        weather: { type: Type.STRING }
       }
-    });
-
-    const text = response.text || "{}";
+    };
     
-    // Safety extraction: find first '{' and corresponding balancing '}'
-    let jsonStr = text.trim();
-    const start = jsonStr.indexOf('{');
-    if (start !== -1) {
-      let depth = 0;
-      let end = -1;
-      let inString = false;
-      let escape = false;
-      const stack: string[] = [];
-
-      for (let i = start; i < jsonStr.length; i++) {
-        const char = jsonStr[i];
-
-        if (char === '"' && !escape) {
-          inString = !inString;
-        }
-
-        if (!inString) {
-          if (char === '{') {
-            depth++;
-            stack.push('{');
-          } else if (char === '[') {
-            depth++;
-            stack.push('[');
-          } else if (char === '}') {
-            depth--;
-            stack.pop();
-          } else if (char === ']') {
-            depth--;
-            stack.pop();
-          }
-          
-          if (depth === 0) {
-            end = i;
-            break;
-          }
-        }
-
-        if (char === '\\') {
-          escape = !escape;
-        } else {
-          escape = false;
-        }
-      }
-      
-      if (end !== -1) {
-        jsonStr = jsonStr.substring(start, end + 1);
-      } else {
-        // If truncated, try to close it minimally
-        if (inString) jsonStr += '"';
-        while (stack.length > 0) {
-          const last = stack.pop();
-          if (last === '{') jsonStr += '}';
-          else if (last === '[') jsonStr += ']';
-        }
-      }
-    }
+    const tier = playerState.aiTier || 'flash';
     
+    const text = await fetchAIWrapper(
+       apiKey,
+       context,
+       systemPromptFinal,
+       true,
+       responseSchemaObj,
+       tier,
+       playerState.preferCustomKey
+    );
+    
+    let gameData: GameResponse;
     try {
-      return JSON.parse(jsonStr);
+      gameData = JSON.parse(text);
     } catch (parseError) {
-      console.error("Original Text:", text);
-      console.error("Cleaned Text:", jsonStr);
-      throw parseError;
+      console.error("JSON Parse Error. Raw text:", text);
+      throw new Error("Lỗi xử lý dữ liệu từ Thiên Cơ (JSON Parse Error).");
     }
-  } catch (error) {
-    console.error("Gemini Error:", error);
-    return {
-      story: "Thiên Đạo xuất hiện dị biến, không thể tiếp tục diễn hóa. Hãy thử lại sau.",
-      actions: [{ id: 1, text: "Thử lại linh cảm" }],
-      mapData: []
-    } as any;
-  }
-}
 
-export async function processCombatOutcome(
-  playerState: any,
-  winnerId: string | undefined,
-  logs: string[],
-  history: GameHistoryItem[]
-): Promise<GameResponse> {
-  try {
-    const rawApiKey = playerState.customApiKey || process.env.GEMINI_API_KEY || "";
-    const apiKey = rawApiKey.replace(/[^\x20-\x7E]/g, "").trim();
-    if (!apiKey) throw new Error("API Key is missing or invalid.");
-    const customAi = new GoogleGenAI({ apiKey });
-
-    // Identify winner
-    const winner = playerState.combatState?.participants.find((p: any) => p.id === winnerId);
-    const isPlayerWinner = winner?.isPlayer;
-
-    const combatResultPrompt = `KẾT QUẢ ĐÃ ĐƯỢC XÁC ĐỊNH BỞI COMBAT UI:
-- Phe thắng: ${isPlayerWinner ? "Người chơi (MC)" : "Kẻ thù"}
-- Logs trận đánh cuối cùng:
-${logs.slice(-5).join('\\n')}
-
-[NHIỆM VỤ CỦA BẠN LÀ LÀM TRỌNG TÀI BÁO CÁO KẾT QUẢ CHIẾN ĐẤU]
-1. Viết một đoạn 'story' (Văn xuôi, khoảng 150-300 chữ) bằng tiếng Việt phong cách tu tiên miêu tả chân thực cú đánh quyết định dứt điểm trận đấu, cảnh máu me tàn khốc, và thu dọn chiến trường.
-2. NGUYÊN TẮC: TUYỆT ĐỐI không cho kẻ địch hồi sinh nếu MC đã thắng. Kẻ địch phải bị đánh gục hoặc bỏ chạy. 
-3. LOOT & TRẠNG THÁI: Tự động cập nhật 'inventoryAdd', 'healthChange', hoặc bất cứ hệ quả nào của trận chiến (VD: thu được yêu đan, vũ khí). ĐỪNG hỏi người chơi muốn loot không, hệ thống tự động loot nếu thắng. Mọi NPC địch tham gia trận chiến khi đã chết, PHẢI cập nhật 'status': 'dead' thông qua mảng 'npcs'. CHÚ Ý ĐẶC BIỆT: NẾU KẺ ĐỊCH LÀ YÊU THÚ, TUYỆT ĐỐI KHÔNG ĐƯỢC RỚT ĐAN DƯỢC (PILLS/ELIXIRS) HAY PHÁP KHÍ, CHỈ ĐƯỢC RỚT YÊU ĐAN VÀ NGUYÊN LIỆU (da, xương, vuốt, thịt, nọc độc...).
-4. CẬP NHẬT CHRONICLES (BẮT BUỘC DỮ NGUYÊN CẤU TRÚC): Cập nhật 'chronicles' bằng cách thêm vào phần cuối của mục [DÒNG THỜI GIAN SỰ KIỆN LỚN (TIMELINE)] và có thể cập nhật các mục khác nếu có biến cố quan trọng (đạt bảo vật, diệt nhân vật quan trọng). LUÔN DUY TRÌ đúng 4 mục của Chronicles hiện tại.
-5. TRẢ VỀ CÁC HÀNH ĐỘNG ('actions') để người chơi có thể tiếp tục hành trình sau trận chiến.`;
-
-    const MAX_HISTORY_LENGTH = 3;
-    const recentHistory = history && history.length > 0
-      ? history.slice(-MAX_HISTORY_LENGTH).map(h => `Hành động: ${h.actionTaken}\\nDiễn biến: ${h.story}`).join('\\n\\n')
-      : "";
-
-    const context = `
-    DỮ LIỆU HIỆN TẠI:
-    - Tên MC: ${playerState.name}
-    - Cảnh giới: ${playerState.realm} (${playerState.stage})
-    - TÌNH TRẠNG SAU CHIẾN ĐẤU: HP ${playerState.health}, MP ${playerState.mana}
-    - KẺ ĐỊCH GẦN NHẤT: ${JSON.stringify(playerState.combatState?.participants.filter((p: any) => !p.isPlayer) || [])}
-    - CHRONICLES HIỆN TẠI: ${playerState.chronicles}
-    - TRÍ NHỚ NGẮN HẠN (LƯỢT TRƯỚC):
-    ${recentHistory}
-
-    ${combatResultPrompt}
-    `;
-
-    const response = await customAi.models.generateContent({
-      model: "gemini-3-flash-preview",
-      contents: context,
-      config: {
-        systemInstruction: "BẠN LÀ 1 AI CHUYÊN XỬ LÝ HẬU QUẢ VÀ TƯỜNG THUẬT KẾT QUẢ COMBAT. CHỈ TRẢ VỀ DỮ LIỆU CHUẨN JSON, KHÔNG THÔNG BÁO. TÔN TRỌNG NGHIÊM NGẶT KẾT QUẢ CỦA GAME (NẾU GAME BÁO MC THẮNG = MC CHẮC CHẮN SỐNG & ĐỊCH CHẾT/BỎ CHẠY, NGƯỢC LẠI NẾU MC THUA). TRẢ VỀ ÍT NHẤT 1 'story' MIÊU TẢ CHIẾN TRƯỜNG.",
-        responseMimeType: "application/json",
-        maxOutputTokens: 4096,
-        responseSchema: {
+    // Auto-Expansion Logic: If story is under ~3500 chars (approx 700-800 words), 
+    // request a detailed extension to ensure > 1000 words total.
+    if (gameData.story.length < 3500) {
+      try {
+        const expansionContext = `${context}\n\nNỘI DUNG VỪA TẠO:\n${gameData.story}\n\nYÊU CẦU: Hãy viết TIẾP NỐI đoạn trên để MIÊU TẢ CHI TIẾT VÀ SÂU SẮC HƠN về bối cảnh, tâm trạng nhân vật, các chi tiết ẩn dụ hoặc không khí xung quanh. Đoạn bổ sung này phải dài khoảng 500-700 từ (2000-3000 ký tự). Chỉ trả về văn bản mô tả mở rộng, không lặp lại phần cũ.`;
+        
+        const expansionSchema = {
           type: Type.OBJECT,
-          required: ["story", "actions"],
+          required: ["expansion"],
           properties: {
-             story: { type: Type.STRING },
-             actions: {
-               type: Type.ARRAY,
-               items: {
-                 type: Type.OBJECT,
-                 required: ["id", "text"],
-                 properties: {
-                   id: { type: Type.NUMBER },
-                   text: { type: Type.STRING }
-                 }
-               }
-             },
-             playerUpdates: {
-                type: Type.OBJECT,
-                properties: {
-                   healthChange: { type: Type.NUMBER },
-                   manaChange: { type: Type.NUMBER },
-                   tuViChange: { type: Type.NUMBER },
-                   inventoryAdd: {
-                     type: Type.ARRAY,
-                     items: {
-                       type: Type.OBJECT,
-                       properties: {
-                         name: { type: Type.STRING },
-                         description: { type: Type.STRING },
-                         type: { type: Type.STRING, description: "Type: Đan dược, Vật liệu, Nhiệm vụ..." },
-                         consumableEffects: {
-                           type: Type.OBJECT,
-                           properties: {
-                             hpRestore: { type: Type.NUMBER },
-                             manaRestore: { type: Type.NUMBER },
-                             tuViBonus: { type: Type.NUMBER },
-                             maxHpIncrease: { type: Type.NUMBER },
-                             maxManaIncrease: { type: Type.NUMBER },
-                             breakthroughBonus: { type: Type.NUMBER }
-                           }
-                         }
-                       }
-                     }
-                   },
-                   inventoryRemove: { type: Type.ARRAY, items: { type: Type.STRING } },
-                   missionUpdates: {
-                     type: Type.ARRAY,
-                     items: {
-                       type: Type.OBJECT,
-                       required: ["id"],
-                       properties: {
-                         id: { type: Type.STRING },
-                         status: { type: Type.STRING },
-                         progress: { type: Type.NUMBER },
-                         targetLocation: { type: Type.STRING }
-                       }
-                     }
-                   },
-                   skillsAdd: { type: Type.ARRAY, items: { type: Type.OBJECT, properties: { name: { type: Type.STRING }, description: { type: Type.STRING } } } }
-                }
-             },
-             npcs: {
-               type: Type.ARRAY,
-               items: {
-                 type: Type.OBJECT,
-                 required: ["id", "name", "status"],
-                 properties: {
-                   id: { type: Type.STRING },
-                   name: { type: Type.STRING },
-                   status: { type: Type.STRING },
-                   health: { type: Type.NUMBER },
-                   maxHealth: { type: Type.NUMBER },
-                   attack: { type: Type.NUMBER },
-                   defense: { type: Type.NUMBER },
-                   speed: { type: Type.NUMBER },
-                   accuracy: { type: Type.NUMBER },
-                   realm: { type: Type.STRING }
-                 }
-               }
-             },
-             chronicles: { type: Type.STRING }
+            expansion: { type: Type.STRING }
           }
-        }
-      }
-    });
+        };
 
-    const text = response.text || "{}";
-    
-    // Safety extraction: find first '{' and corresponding balancing '}'
-    let jsonStr = text.trim();
-    const start = jsonStr.indexOf('{');
-    if (start !== -1) {
-      let depth = 0;
-      let end = -1;
-      let inString = false;
-      let escape = false;
-      const stack: string[] = [];
+        const expansionText = await fetchAIWrapper(
+          apiKey,
+          expansionContext,
+          systemPromptFinal + "\n\nCHÚ Ý: Chỉ trả về JSON với trường 'expansion' chứa nội dung viết tiếp.",
+          true,
+          expansionSchema,
+          tier,
+          playerState.preferCustomKey
+        );
 
-      for (let i = start; i < jsonStr.length; i++) {
-        const char = jsonStr[i];
-
-        if (char === '"' && !escape) {
-          inString = !inString;
+        const expansionData = JSON.parse(expansionText);
+        if (expansionData.expansion) {
+          gameData.story += "\n\n----\n\n" + expansionData.expansion;
         }
-
-        if (!inString) {
-          if (char === '{') {
-            depth++;
-            stack.push('{');
-          } else if (char === '[') {
-            depth++;
-            stack.push('[');
-          } else if (char === '}') {
-            depth--;
-            stack.pop();
-          } else if (char === ']') {
-            depth--;
-            stack.pop();
-          }
-          
-          if (depth === 0) {
-            end = i;
-            break;
-          }
-        }
-
-        if (char === '\\') {
-          escape = !escape;
-        } else {
-          escape = false;
-        }
-      }
-      
-      if (end !== -1) {
-        jsonStr = jsonStr.substring(start, end + 1);
-      } else {
-        // If truncated, try to close it minimally
-        if (inString) jsonStr += '"';
-        while (stack.length > 0) {
-          const last = stack.pop();
-          if (last === '{') jsonStr += '}';
-          else if (last === '[') jsonStr += ']';
-        }
+      } catch (expError) {
+        console.warn("Lỗi khi mở rộng nội dung:", expError);
+        // We still have the original segment, so we continue
       }
     }
-    
-    return JSON.parse(jsonStr);
+
+    return gameData;
   } catch (error) {
-    console.error("Combat AI Error:", error);
-    console.error("Failed JSON string during parsing");
+    console.error("AI Error:", error);
     return {
-      story: "[Biến cố] Kết quả trận chiến xuất hiện dị tượng không thể trần thuật.",
-      actions: [{ id: 1, text: "Nhìn lại chiến trường..." }]
+      story: "Thiên Đạo xuất hiện dị biến, không thể tiếp tục diễn hóa.",
+      actions: [{ id: 1, text: "Thử lại" }]
     };
   }
 }
@@ -1517,67 +509,120 @@ ${logs.slice(-5).join('\\n')}
 export interface PlotSuggestion {
   title: string;
   description: string;
-  type: 'Main' | 'Side' | 'Encounter' | 'Secret';
-  potentialRewards: string[];
+  type: string;
 }
 
-export async function suggestPlot(
-  playerState: any
-): Promise<PlotSuggestion[]> {
+export async function suggestPlot(playerState: PlayerState): Promise<PlotSuggestion[]> {
   try {
-    const rawApiKey = playerState.customApiKey || process.env.GEMINI_API_KEY || "";
-    const apiKey = rawApiKey.replace(/[^\x20-\x7E]/g, "").trim();
-    
-    if (!apiKey) return [];
-    
-    const customAi = new GoogleGenAI({ apiKey });
+    const apiKey = playerState.customApiKey || "";
 
-    const prompt = `
-    DỰA TRÊN DIỄN BIẾN GẦN ĐÂY NHẤT (HISTORY), BIÊN NIÊN SỬ (CHRONICLES) VÀ TRẠNG THÁI HIỆN TẠI CỦA NGƯỜI CHƠI, HÃY PHÂN TÍCH VÀ CHỦ ĐỘNG ĐỀ XUẤT CÁC LỰA CHỌN CỐT TRUYỆN:
-    - Diễn biến gần đây nhất: ${JSON.stringify(playerState.history ? playerState.history.slice(-5).map((h: any) => ({ action: h.action, result: h.result })) : [])}
-    - Biên Niên Sử: ${playerState.chronicles}
-    - Cảnh Giới: ${playerState.realm} (${playerState.stage})
-    - Vị Trí: ${playerState.currentLocation}
-    - Nhân quả (Karma): ${playerState.karma}
-    - Phe phái: ${JSON.stringify(playerState.factionsReputation)}
-    - NPC từng gặp: ${playerState.npcs ? playerState.npcs.map((n: any) => n.name).join(', ') : 'Chưa gặp ai'}
+    const prompt = `Based on the player's history and chronicles, suggest 3 interesting plot directions in Vietnamese for a TU TIEN context. Return as JSON array: [{"title": "...", "description": "...", "type": "..."}]`;
 
-    HÃY ĐỀ XUẤT 3-4 TÌNH TIẾT TRUYỆN TIẾP THEO HOẶC NHIỆM VỤ PHỤ BẮT NGUỒN TRỰC TIẾP TỪ NHỮNG GÌ VỪA XẢY RA HOẶC TỪ TIẾN TRÌNH TRONG BIÊN NIÊN SỬ.
-    Yêu cầu:
-    1. Cơ ưu tiên: Những hành động vừa diễn ra trong "Diễn biến gần đây nhất" (Ví dụ vừa nhận một vật phẩm, vừa làm quen một NPC, vừa đến vùng đất mới).
-    2. Các đề xuất phải mang phong vị Tu Tiên, huyền ảo, như cơ duyên Thiên Cơ đưa lối.
-    3. Phân loại theo: 'Main' (Cốt truyện chính), 'Side' (Nhiệm vụ phụ), 'Encounter' (Kỳ ngộ/Bất ngờ), 'Secret' (Bí mật/Mật cảnh).
-    4. Gợi ý các phần thưởng tiềm năng.
+    const resultText = await fetchAIWrapper(
+      apiKey,
+      prompt,
+      undefined,
+      true,
+      undefined,
+      'flash',
+      playerState.preferCustomKey
+    );
 
-    TRẢ VỀ JSON THEO ĐỊNH DẠNG MẢNG CÁC ĐỐI TƯỢNG (Mọi text KHÔNG BAO GỒM KEY JSON bắt buộc phải viết bằng Tiếng Việt hoặc Hán Việt):
-    [{ "title": "Tên nhiệm vụ/Sự kiện", "description": "Mô tả chi tiết và làm rõ vì sao đề xuất việc này (dựa vào diễn biến gần đây/biên niên sử)", "type": "Main|Side|Encounter|Secret", "potentialRewards": ["Phần thưởng 1", "Phần thưởng 2"] }]
-    `;
-
-    const result = await customAi.models.generateContent({
-      model: "gemini-3-flash-preview",
-      contents: prompt,
-      config: {
-        responseMimeType: "application/json",
-      }
-    });
-
-    let text = result.text || "[]";
-    const startIdx = text.indexOf('[');
-    if (startIdx !== -1) {
-      let count = 0;
-      for (let i = startIdx; i < text.length; i++) {
-        if (text[i] === '[') count++;
-        else if (text[i] === ']') count--;
-        if (count === 0) {
-          text = text.substring(startIdx, i + 1);
-          break;
-        }
-      }
+    try {
+      return JSON.parse(resultText);
+    } catch (e) {
+      console.error("Plot suggestion parse error:", resultText);
+      return [];
     }
-    const suggestions = JSON.parse(text);
-    return suggestions;
   } catch (error) {
-    console.error("Plot Suggestion Error:", error);
     return [];
+  }
+}
+
+export interface LoreSuggestion {
+  world: string;
+  origin: string;
+  majorArcs: string;
+}
+
+export async function generateLoreSuggestions(playerState: PlayerState, section?: 'world' | 'origin' | 'majorArcs'): Promise<LoreSuggestion | null> {
+  try {
+    const apiKey = playerState.customApiKey || "";
+
+    const currentLore = playerState.lore;
+    let sectionPrompt = "";
+    
+    if (section === 'world') {
+      sectionPrompt = "Hãy gợi ý phần 'THẾ GIỚI BẢN NGUYÊN' (World): Mô tả về linh khí, quy tắc thế giới, các tông môn và thế lực lớn.";
+    } else if (section === 'origin') {
+      sectionPrompt = "Hãy gợi ý phần 'NHÂN QUẢ KHỞI ĐẦU' (Origin): Bi kịch, cơ duyên hoặc hoàn cảnh lúc bắt đầu của nhân vật.";
+    } else if (section === 'majorArcs') {
+      sectionPrompt = "Hãy gợi ý phần 'ĐẠI KIẾP CHÂN KINH' (Major Arcs): Các giai đoạn bùng nổ, các bước ngoặt lớn dự kiến của câu chuyện.";
+    } else {
+      sectionPrompt = "Hãy sáng tạo hoặc hoàn thiện bối cảnh tu tiên (Lore) hấp dẫn theo đầy đủ 3 mục.";
+    }
+
+    const prompt = `Dựa trên tên nhân vật "${playerState.name}" và giới tính "${playerState.gender}", ${sectionPrompt}
+
+    Dữ liệu hiện tại:
+    - Thế giới: ${currentLore?.world || "Chưa xác định"}
+    - Khởi đầu: ${currentLore?.origin || "Chưa xác định"}
+    - Các Arc: ${currentLore?.majorArcs || "Chưa xác định"}
+
+    Hãy viết bằng tiếng Việt, phong cách tiên hiệp huyền ảo.
+    TRẢ VỀ ĐỊNH DẠNG JSON: {"world": "...", "origin": "...", "majorArcs": "..."} (Chỉ điền nội dung mới vào mục được yêu cầu, các mục khác giữ nguyên hoặc để trống nếu không đổi).`;
+
+    const systemPrompt = "Bạn là một đại biên kịch chuyên về dòng truyện tiên hiệp và huyền huyễn. Bạn có khả năng xây dựng bối cảnh vô cùng đồ sộ và logic.";
+
+    const text = await fetchAIWrapper(
+      apiKey,
+      prompt,
+      systemPrompt,
+      true,
+      undefined,
+      'flash',
+      playerState.preferCustomKey
+    );
+
+    try {
+      return JSON.parse(text);
+    } catch (e) {
+      console.error("Lore suggestion parse error:", text);
+      return null;
+    }
+  } catch (error) {
+    console.error("Lore Generation Error:", error);
+    return null;
+  }
+}
+
+export async function validateApiKey(apiKey: string): Promise<{ success: boolean; message: string }> {
+  try {
+    const defaultGeminiKey = (typeof process !== 'undefined' ? process.env.GEMINI_API_KEY : "") || "";
+    const keys = getAllKeys(apiKey);
+    
+    if (keys.length === 0) return { success: false, message: "Không tìm thấy key hợp lệ để kiểm tra." };
+    
+    // We'll just test the first key
+    const keyToTest = keys[0];
+    const isDefault = keyToTest === defaultGeminiKey && !apiKey.trim().includes(keyToTest);
+    
+    const ai = new GoogleGenAI({ apiKey: keyToTest });
+    // Use a very simple and cheap model/request for validation
+    await ai.models.generateContent({
+      model: 'gemini-3-flash-preview',
+      contents: [{ role: 'user', parts: [{ text: 'Hi' }] }]
+    });
+    
+    return { 
+      success: true, 
+      message: isDefault ? "Kết nối Thiên Cơ (Mặc định) hoạt động tốt!" : "Kết nối Thiên Cơ (Custom) hoạt động tốt!" 
+    };
+  } catch (error: any) {
+    console.error("API Key Validation Error:", error);
+    let msg = error.message || String(error);
+    if (msg.includes("403") || msg.includes("invalid")) msg = "API Key không hợp lệ hoặc không có quyền truy cập.";
+    if (msg.includes("429")) msg = "API Key hoạt động nhưng đang bị giới hạn lưu lượng (Quota Exceeded).";
+    return { success: false, message: msg };
   }
 }
