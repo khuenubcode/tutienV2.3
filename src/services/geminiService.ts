@@ -3,6 +3,7 @@ import { PlayerState, GameHistoryItem, NPC, InventoryItem } from "../types";
 import { TALK_RULES } from "../../Promtp/TalkRule";
 import { NPC_AGE_RULES } from "../../Promtp/AgeRule";
 import { SEXUAL_POSE_RULES } from "../../Promtp/sexualPoseRule";
+import { LOGIC_NFSW } from "../../Promtp/logicNFSW";
 
 export interface AIUsage {
   promptTokens: number;
@@ -330,6 +331,7 @@ RULES:
 10. QUY TẮC XƯNG HÔ: {talkRules}
 11. QUY TẮC NGOẠI HÌNH THEO TUỔI: {ageRules}
 12. QUY TẮC TƯ THẾ HOAN LẠC: {sexualPoseRules}
+13. PHÁT TRIỂN NSFW VÀ TÍNH CÁCH: {logicNsfw}
 
 JSON RESPONSE FORMAT:
 Respond with a JSON object matching this structure:
@@ -376,7 +378,8 @@ export async function generateNextStep(
       .replace('{scenePopupInstruction}', scenePopupInstruction)
       .replace('{talkRules}', TALK_RULES)
       .replace('{ageRules}', NPC_AGE_RULES)
-      .replace('{sexualPoseRules}', SEXUAL_POSE_RULES);
+      .replace('{sexualPoseRules}', SEXUAL_POSE_RULES)
+      .replace('{logicNsfw}', playerState.isNsfwEnabled ? LOGIC_NFSW : "Hủy bỏ mọi quy tắc NSFW.");
 
     const context = `
     TÓM TẮT DÀI HẠN: ${playerState.chronicles}
