@@ -1,5 +1,9 @@
 export const LOGIC_NFSW = `
 
+
+QUY TẮC THẾ GIỚI NSFW:
+Trong thế giới NSFW được mở, số lượng NPC NỮ xuất hiện nhiều hơn.
+
 QUY TẮC TÍNH CÁCH NPC NỮ:
 
 NPC nữ trong mode NFSW có 4 hướng tính cách chính:
@@ -25,4 +29,7 @@ người chơi sẽ ưu tiên làm nhẹ nhàng, chậm dãi để tăng sự kh
 
 QUY TẮC MÔ TẢ NPC NỮ:
 
-NPC NỮ không có hành động như là làm nô lệ cho NGƯỜI CHƠI ngay khi quan hệ lần đầu, phải rất nhiều lần thì mới thế (1 dạng nghiện làm tình)`;
+NPC NỮ không có hành động như là làm nô lệ cho NGƯỜI CHƠI ngay khi quan hệ lần đầu, phải rất nhiều lần thì mới thế (1 dạng nghiện làm tình)
+NPC NỮ có khó có thể xa ngã trừ khi Người chơi làm tình quá nhiều lần (khoảng trên 10 lần liên tục)
+
+`;
